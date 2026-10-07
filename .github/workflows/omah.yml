@@ -1,0 +1,195 @@
+# Put this file at .github/workflows/omah.yml in the Omah repo.
+# The repo root must also contain: agent.ts, system.md, .omahignore.default,
+# package.json, package-lock.json, and tsconfig.json.
+#
+# Secrets (Settings -> Secrets and variables -> Actions):
+#   GEMINI_KEYS            JSON array of Gemini keys, e.g. ["key1","key2"]
+#   OMAH_APP_ID            GitHub App ID
+#   OMAH_APP_PRIVATE_KEY   GitHub App private key (PEM)
+# Variables (optional):
+#   OMAH_APP_BOT_ID        bot user id (skips one API lookup)
+#   OMAH_ALLOWED_REPOS     comma-separated "owner/name" allowlist
+
+name: Omah
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Target repo (owner/name)"
+        required: true
+        type: string
+      task:
+        description: "What should Omah do? (new runs)"
+        required: false
+        type: string
+      base_branch:
+        description: "Base branch (blank = repo default)"
+        required: false
+        type: string
+      resume:
+        description: "Resume an existing Omah branch"
+        required: false
+        type: boolean
+        default: false
+      branch:
+        description: "Omah branch to resume, e.g. omah/fix-auth-1a2b3c4d"
+        required: false
+        type: string
+      resume_text:
+        description: "Follow-up instruction (resume only)"
+        required: false
+        type: string
+
+# The default GITHUB_TOKEN only needs to check out this repo.
+permissions:
+  contents: read
+
+# One run at a time (serial by design).
+concurrency:
+  group: omah
+  cancel-in-progress: false
+
+jobs:
+  omah:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate inputs
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_TASK: ${{ inputs.task }}
+          INPUT_RESUME: ${{ inputs.resume }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_RESUME_TEXT: ${{ inputs.resume_text }}
+          ALLOWED_REPOS: ${{ vars.OMAH_ALLOWED_REPOS }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$INPUT_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::repo must look like owner/name"; exit 1
+          fi
+
+          if [[ -n "${ALLOWED_REPOS:-}" ]]; then
+            ok=false
+            IFS=',' read -ra repos <<< "$ALLOWED_REPOS"
+            for r in "${repos[@]}"; do
+              [[ "${r// /}" == "$INPUT_REPO" ]] && ok=true
+            done
+            $ok || { echo "::error::repo is not in OMAH_ALLOWED_REPOS"; exit 1; }
+          fi
+
+          if [[ "$INPUT_RESUME" == "true" ]]; then
+            [[ "$INPUT_BRANCH" =~ ^omah/[a-z0-9-]+$ ]] \
+              || { echo "::error::resume needs a branch like omah/some-task-1a2b3c4d"; exit 1; }
+            [[ -n "$INPUT_RESUME_TEXT" ]] \
+              || { echo "::error::resume needs resume_text"; exit 1; }
+          else
+            [[ -n "$INPUT_TASK" ]] \
+              || { echo "::error::new runs need a task"; exit 1; }
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create agent user and lock down runner files
+        run: |
+          set -euo pipefail
+          sudo useradd --create-home --shell /bin/bash omah-runner
+
+          # /tmp/omah stays owned by the runner user. agent.ts chowns only
+          # /tmp/omah/workspace to the agent user.
+          mkdir -p /tmp/omah
+          chmod 755 /tmp/omah
+
+          # Keep the agent out of everything the runner user owns.
+          # The agent gets its own HOME and npm cache via agent.ts.
+          sudo chmod o-rwx "$HOME"
+          chmod 700 "$RUNNER_TEMP"
+
+      - name: Isolation canary
+        run: |
+          set -u
+          fail=0
+
+          denied() {
+            local desc="$1"; shift
+            if "$@" >/dev/null 2>&1; then
+              echo "LEAK:   $desc"; fail=1
+            else
+              echo "ok:     $desc"
+            fi
+          }
+          allowed() {
+            local desc="$1"; shift
+            if "$@" >/dev/null 2>&1; then
+              echo "ok:     $desc"
+            else
+              echo "BROKEN: $desc"; fail=1
+            fi
+          }
+
+          # Can't unquoted-expand $AGENT across multiple words, so use a
+          # wrapper function that runs a single command as the agent user.
+          as_agent() {
+            sudo -u omah-runner env PATH="$PATH" HOME=/home/omah-runner "$@"
+          }
+
+          denied  "agent cannot list runner home"        as_agent ls /home/runner
+          denied  "agent cannot list runner temp"        as_agent ls "$RUNNER_TEMP"
+          denied  "agent cannot read GITHUB_ENV"         as_agent cat "$GITHUB_ENV"
+          denied  "agent cannot read GITHUB_WORKSPACE"   as_agent ls "$GITHUB_WORKSPACE"
+          denied  "agent cannot read runner proc env"    as_agent cat /proc/1/environ
+          denied  "agent has no sudo"                    as_agent sudo -n true
+          denied  "agent cannot use docker"              as_agent docker ps
+
+          allowed "agent can run node"                   as_agent node --version
+          allowed "agent can run git"                    as_agent git --version
+          allowed "agent can write its home"             as_agent touch /home/omah-runner/.canary
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo "::error::isolation canary failed"; exit 1
+          fi
+
+      - name: Run Omah
+        id: omah
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_TASK: ${{ inputs.task }}
+          INPUT_BASE_BRANCH: ${{ inputs.base_branch }}
+          INPUT_RESUME: ${{ inputs.resume }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_RESUME_TEXT: ${{ inputs.resume_text }}
+          GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
+          APP_ID: ${{ secrets.OMAH_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.OMAH_APP_PRIVATE_KEY }}
+          APP_BOT_ID: ${{ vars.OMAH_APP_BOT_ID }}
+        run: npx tsx agent.ts
+
+      - name: Summary
+        if: always()
+        env:
+          PR_URL: ${{ steps.omah.outputs.pr_url }}
+          STATUS: ${{ steps.omah.outputs.status }}
+        run: |
+          {
+            echo "## Omah result"
+            echo ""
+            echo "- Status: ${STATUS:-unknown}"
+            echo "- PR: ${PR_URL:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo pkill -9 -u omah-runner || true
+          sudo rm -rf /tmp/omah

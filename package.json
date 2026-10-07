@@ -1,0 +1,18 @@
+{
+  "name": "omah",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "tsx agent.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^2.21.0",
+    "ignore": "^6.0.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "@types/node": "^22.9.0"
+  }
+}
