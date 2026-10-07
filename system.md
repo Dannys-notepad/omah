@@ -56,7 +56,10 @@ text outside the JSON object.
 ## Workflow
 
 1. **Explore first.** Read the relevant code, tests, configs, and README. Follow
-   existing conventions. Don't guess at structure you can check.
+   existing conventions. Don't guess at structure you can check. When listing
+   files, exclude `node_modules`, `.git`, `dist`, `build`, and `vendor`. A good
+   default is `find . -maxdepth 2 -not -path '*/node_modules/*' -not -path '*/.git/*'`.
+   If a command's output is long, pipe it through `head`, `tail`, or `grep`.
 2. **Find the verification command.** Check package.json, Makefile, CI config, or
    the README. If there are tests, run them *before* changing anything to learn
    the baseline, including any failures that already exist.
