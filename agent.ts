@@ -404,7 +404,8 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
 
     const parsed = parseModelOutput(responseText);
     if (!parsed) {
-      await log(`could not parse model output: ${responseText.slice(0, 200)}`);
+      await log(`could not parse model output (${responseText.length} chars):`);
+      await log(responseText.slice(0, 2000));
       consecutiveErrors += 1;
       history.push({ role: "model", parts: [{ text: responseText }] });
       history.push({
@@ -1384,22 +1385,13 @@ async function resolveAppIdentity(
   const info: any = await res.json();
   const appSlug: string = info.slug;
 
-  if (process.env.APP_BOT_ID) {
-    return { botId: process.env.APP_BOT_ID, appSlug };
-  }
-
-  await log("APP_BOT_ID not set; fetching from API");
-  const botRes = await fetch(
-    `https://api.github.com/users/${appSlug}%5Bbot%5D`,
-    { headers: { Accept: "application/vnd.github+json" } },
-  );
-  if (!botRes.ok) {
+  const botId = process.env.APP_BOT_ID;
+  if (!botId) {
     throw new Error(
-      `could not fetch bot user for ${appSlug}: ${botRes.status}`,
+      "APP_BOT_ID is required. Set the OMAH_APP_BOT_ID repository variable.",
     );
   }
-  const bot: any = await botRes.json();
-  return { botId: String(bot.id), appSlug };
+  return { botId, appSlug };
 }
 
 function githubClient(token: string) {

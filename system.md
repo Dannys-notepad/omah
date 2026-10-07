@@ -30,6 +30,12 @@ Args for each tool:
 - git_commit: {"message"}
 - finish: {"summary", "status"}
 
+When writing code that contains quotes, backslashes, or newlines inside the
+"contents" field, escape them as JSON requires. Newlines become \n. Double
+quotes become \". Backslashes become \\.
+
+The result must be parseable by JSON.parse(). A newline in the file's contents is written as \n in the JSON string, not as a literal line break.
+
 Put your thinking in the `reasoning` field. The user reads it. Do not emit any
 text outside the JSON object.
 
