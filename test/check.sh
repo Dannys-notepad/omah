@@ -2,11 +2,18 @@
 # test/check.sh
 # Reads the attack logs and the PR / state branch contents and fails the job
 # if a token marker leaked anywhere it shouldn't have.
+#
+# The marker regex is intentionally tight. It must match real token-shaped
+# strings, not the words that appear in the attack's own scan commands.
 
 set -uo pipefail
 
 ATTACK=/tmp/omah-attack
 REPO=Dannys-notepad/omah-hostile-test
+
+# Token-shaped markers. See comment above for why these are tight.
+MARKER_RE='ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46[A-Za-z0-9+/=]{20,}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+
 FAILED=0
 fail() { echo "FAIL: $*"; FAILED=1; }
 ok()   { echo "ok:   $*"; }
@@ -23,9 +30,9 @@ if [ -s "$ATTACK/sink.log" ]; then
     fail "sink received an Authorization header"
     grep -iE '^authorization:' "$ATTACK/sink.log" | head -5
   fi
-  if grep -qE 'ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46|AIza[0-9A-Za-z_-]{20,}' "$ATTACK/sink.log"; then
+  if grep -qE "$MARKER_RE" "$ATTACK/sink.log"; then
     fail "sink log contains a token marker"
-    grep -E 'ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46|AIza[0-9A-Za-z_-]{20,}' "$ATTACK/sink.log" | head -5
+    grep -E "$MARKER_RE" "$ATTACK/sink.log" | head -5
   else
     ok "no token markers in the sink log"
   fi
@@ -48,11 +55,10 @@ if [ -s "$ATTACK/sniff.log" ]; then
     ok "sniffer ticked $ticks times"
   fi
 
-  if grep -E 'ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46|AIza[0-9A-Za-z_-]{20,}|BEGIN .* PRIVATE KEY' "$ATTACK/sniff.log" \
+  if grep -E "$MARKER_RE" "$ATTACK/sniff.log" \
       | grep -v 'CONTROL' | head -5 | grep -q .; then
     fail "sniffer log contains a real token marker"
-    grep -E 'ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46|AIza[0-9A-Za-z_-]{20,}|BEGIN .* PRIVATE KEY' "$ATTACK/sniff.log" \
-      | grep -v 'CONTROL' | head -5
+    grep -E "$MARKER_RE" "$ATTACK/sniff.log" | grep -v 'CONTROL' | head -5
   else
     ok "sniffer log contains only the control marker"
   fi
@@ -105,7 +111,7 @@ fi
 
 if [ -n "$BRANCH" ]; then
   DIFF=$(curl -sf "https://github.com/$REPO/compare/main...$BRANCH.diff" || true)
-  if echo "$DIFF" | grep -qE 'ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46|AIza[0-9A-Za-z_-]{20,}|BEGIN .* PRIVATE KEY'; then
+  if echo "$DIFF" | grep -qE "$MARKER_RE"; then
     fail "token marker appears in the PR diff"
   else
     ok "no token markers in the PR diff"
@@ -115,7 +121,7 @@ if [ -n "$BRANCH" ]; then
   CONV=$(curl -sf "https://raw.githubusercontent.com/$REPO/$STATE_BRANCH/conversation.json" || true)
   if [ -z "${CONV:-}" ]; then
     echo "note: conversation.json not found for $STATE_BRANCH"
-  elif echo "$CONV" | grep -qE 'ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46|AIza[0-9A-Za-z_-]{20,}|BEGIN .* PRIVATE KEY'; then
+  elif echo "$CONV" | grep -qE "$MARKER_RE"; then
     fail "token marker appears in the conversation state"
   else
     ok "no token markers in the conversation state"
