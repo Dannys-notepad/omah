@@ -9,6 +9,13 @@
 //   - Tokens are passed via environment variables, never via command-line
 //     arguments (which are visible in /proc/<pid>/cmdline to all users).
 //
+// Write model (v2):
+//   File contents never travel inside JSON. The model calls request_write(path),
+//   the harness asks for raw content, the model emits raw text (optionally split
+//   across chunks with sentinel lines), and the harness assembles and writes.
+//   This eliminates a class of parse failures caused by raw newlines and
+//   unescaped quotes inside JSON strings.
+//
 // Environment (set by the workflow):
 //   INPUT_REPO         target repo, "owner/name"
 //   INPUT_TASK         the user's prompt (only for new tasks)
@@ -19,7 +26,7 @@
 //   GEMINI_KEYS        JSON array of Gemini API keys
 //   APP_ID             GitHub App ID
 //   APP_PRIVATE_KEY    GitHub App private key (PEM)
-//   APP_BOT_ID         GitHub App bot user ID (optional; fetched if missing)
+//   APP_BOT_ID         GitHub App bot user ID (required)
 
 import { promises as fs, appendFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
@@ -42,6 +49,23 @@ const MAX_LLM_RETRIES = 3;
 const MAX_PATCH_BYTES = 5 * 1024 * 1024;
 const MAX_PR_BODY_CHARS = 60_000;
 
+// Write limits (in bytes; the prompt talks in lines).
+const MAX_CHUNK_BYTES = 200 * 1024;      // soft cap per chunk
+const MAX_FILE_BYTES = 500 * 1024;       // hard cap per file
+
+// Sentinels for chunked writes.
+const SENTINEL_MORE = "<<<OMAH_MORE>>>";
+const SENTINEL_END = "<<<OMAH_END>>>";
+
+// Known tool names for the forgotten-handshake guard.
+const TOOL_NAMES = new Set<string>([
+  "read_file",
+  "request_write",
+  "run_bash",
+  "git_commit",
+  "finish",
+]);
+
 const OMAH_ROOT = "/tmp/omah";
 const WORKSPACE = path.join(OMAH_ROOT, "workspace");
 const SYSTEM_PROMPT_PATH = path.join(process.cwd(), "system.md");
@@ -55,7 +79,7 @@ const AGENT_HOME = `/home/${AGENT_USER}`;
 
 type ToolName =
   | "read_file"
-  | "write_file"
+  | "request_write"
   | "run_bash"
   | "git_commit"
   | "finish";
@@ -65,6 +89,15 @@ interface Message {
   parts: Array<{ text: string }>;
 }
 
+interface ConversationStep {
+  step: number;
+  reasoning: string;
+  tool: ToolName;
+  args: Record<string, unknown>;
+  result: { ok: boolean; output: string; truncated?: boolean };
+  at: string;
+}
+
 interface Conversation {
   version: 1;
   taskId: string;
@@ -72,14 +105,7 @@ interface Conversation {
   targetRepo: string;
   baseBranch: string;
   branchName: string;
-  steps: Array<{
-    step: number;
-    reasoning: string;
-    tool: ToolName;
-    args: Record<string, unknown>;
-    result: { ok: boolean; output: string; truncated?: boolean };
-    at: string;
-  }>;
+  steps: ConversationStep[];
   finished: boolean;
   summary?: string;
   status?: "done" | "blocked";
@@ -91,6 +117,24 @@ interface ExecResult {
   stderr: string;
   code: number;
 }
+
+// State for a chunked write in progress.
+interface WriteState {
+  path: string;
+  chunks: Buffer[];
+  bytesTotal: number;
+}
+
+type ChunkErrorCode =
+  | "TOOL_CALL_GUARD"
+  | "MISSING_SENTINEL"
+  | "CHUNK_TOO_LARGE"
+  | "FILE_TOO_LARGE";
+
+type ChunkOutcome =
+  | { kind: "more" }
+  | { kind: "end" }
+  | { kind: "error"; code: ChunkErrorCode; message: string };
 
 // ---------------------------------------------------------------
 // Helpers: run commands
@@ -251,6 +295,7 @@ async function main(): Promise<void> {
   await log(`startSha=${startSha}`);
 
   const systemPrompt = await fs.readFile(SYSTEM_PROMPT_PATH, "utf8");
+  await log(`system prompt: ${extractPromptVersion(systemPrompt)}`);
   const keys = loadKeys();
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
 
@@ -321,6 +366,12 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
   let consecutiveErrors = 0;
   let keyIndex = 0;
 
+  // Write state: set when we've asked the model for raw file content.
+  let writeState: WriteState | null = null;
+  let pendingWriteReasoning = "";
+  let pendingWritePath = "";
+
+  // Replay prior steps on resume.
   if (args.conversation.steps.length > 0) {
     history.push({
       role: "user",
@@ -384,7 +435,12 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
 
     let responseText: string;
     try {
-      responseText = await callModel(model, args.systemPrompt, history);
+      responseText = await callModel(
+        model,
+        args.systemPrompt,
+        history,
+        writeState === null,
+      );
     } catch (err) {
       const quotaHit = isQuotaError(err);
       if (quotaHit) {
@@ -402,6 +458,110 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       throw err;
     }
 
+    // ---------- Raw write mode ----------
+    if (writeState) {
+      const outcome = handleRawChunk(responseText, writeState, writeState.path);
+
+      if (outcome.kind === "error") {
+        if (outcome.code === "TOOL_CALL_GUARD") {
+          await log(
+            `guard: rejected raw write for ${writeState.path} ` +
+              `(looks like a tool call)`,
+          );
+        }
+        await log(`write error [${outcome.code}]: ${outcome.message}`);
+
+        history.push({ role: "model", parts: [{ text: responseText }] });
+        history.push({
+          role: "user",
+          parts: [{ text: `Tool result (error):\n${outcome.message}` }],
+        });
+        args.conversation.steps.push({
+          step: args.conversation.steps.length + 1,
+          reasoning: pendingWriteReasoning,
+          tool: "request_write",
+          args: { path: pendingWritePath },
+          result: {
+            ok: false,
+            output: `[${outcome.code}] ${outcome.message}`,
+          },
+          at: new Date().toISOString(),
+        });
+        writeState = null;
+        consecutiveErrors += 1;
+        await saveConversation(args.conversation, args.targetRepo, args.appToken);
+        continue;
+      }
+
+      if (outcome.kind === "more") {
+        history.push({ role: "model", parts: [{ text: responseText }] });
+        history.push({
+          role: "user",
+          parts: [
+            {
+              text:
+                "Continue with the next chunk. End the final chunk with a line " +
+                `containing only ${SENTINEL_END}. Do not repeat the file header.`,
+            },
+          ],
+        });
+        continue;
+      }
+
+      // outcome.kind === "end": assemble and write the file.
+      const contents = Buffer.concat(writeState.chunks);
+      const writeResult = await writeAsAgentBytes(writeState.path, contents);
+
+      const stepNo = args.conversation.steps.length + 1;
+      if (writeResult.ok) {
+        await log(
+          `[step ${stepNo}] request_write ${writeState.path} ` +
+            `(${contents.length} bytes, ${writeState.chunks.length} chunk(s))`,
+        );
+      } else {
+        await log(
+          `[step ${stepNo}] request_write ${writeState.path} FAILED: ${writeResult.output}`,
+        );
+      }
+
+      args.conversation.steps.push({
+        step: stepNo,
+        reasoning: pendingWriteReasoning,
+        tool: "request_write",
+        args: { path: writeState.path },
+        result: {
+          ok: writeResult.ok,
+          output: writeResult.ok
+            ? `wrote ${writeState.path} (${contents.length} bytes)`
+            : writeResult.output,
+        },
+        at: new Date().toISOString(),
+      });
+
+      history.push({
+        role: "model",
+        parts: [{ text: `[raw file content for ${writeState.path}]` }],
+      });
+      history.push({
+        role: "user",
+        parts: [
+          {
+            text: writeResult.ok
+              ? `Tool result (ok): wrote ${writeState.path} (${contents.length} bytes)`
+              : `Tool result (error): ${writeResult.output}`,
+          },
+        ],
+      });
+
+      if (writeResult.ok) consecutiveErrors = 0;
+      else consecutiveErrors += 1;
+
+      writeState = null;
+      await saveConversation(args.conversation, args.targetRepo, args.appToken);
+      continue;
+    }
+
+    // ---------- Normal JSON mode ----------
     const parsed = parseModelOutput(responseText);
     if (!parsed) {
       await log(`could not parse model output (${responseText.length} chars):`);
@@ -439,7 +599,72 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       return { summary, status };
     }
 
-    const result = await runTool(parsed.tool, parsed.args);
+    // request_write: enter raw mode instead of executing a tool.
+    if (parsed.tool === "request_write") {
+      const p = String(parsed.args.path ?? "");
+      if (!p) {
+        consecutiveErrors += 1;
+        history.push({ role: "model", parts: [{ text: responseText }] });
+        history.push({
+          role: "user",
+          parts: [
+            {
+              text:
+                "Tool result (error): request_write needs a path. " +
+                'Respond with {"reasoning": "...", "tool": "request_write", "args": {"path": "..."}}',
+            },
+          ],
+        });
+        continue;
+      }
+
+      // Validate the path before the model spends tokens writing content.
+      try {
+        safePath(p);
+      } catch (err: any) {
+        const msg = String(err?.message ?? err);
+        consecutiveErrors += 1;
+        history.push({ role: "model", parts: [{ text: responseText }] });
+        history.push({
+          role: "user",
+          parts: [{ text: `Tool result (error): ${msg}` }],
+        });
+        args.conversation.steps.push({
+          step: args.conversation.steps.length + 1,
+          reasoning: parsed.reasoning,
+          tool: "request_write",
+          args: { path: p },
+          result: { ok: false, output: msg },
+          at: new Date().toISOString(),
+        });
+        await saveConversation(args.conversation, args.targetRepo, args.appToken);
+        continue;
+      }
+
+      pendingWritePath = p;
+      pendingWriteReasoning = parsed.reasoning;
+      writeState = { path: p, chunks: [], bytesTotal: 0 };
+
+      history.push({ role: "model", parts: [{ text: responseText }] });
+      history.push({
+        role: "user",
+        parts: [
+          {
+            text:
+              `Reply with the raw contents of ${p}. Do not wrap it in JSON, ` +
+              `do not add fences, do not add explanation. End with a line ` +
+              `containing only ${SENTINEL_END}. If the file is large, split ` +
+              `it: end each non-final chunk with ${SENTINEL_MORE} on its own line.`,
+          },
+        ],
+      });
+      continue;
+    }
+
+    const result = await runTool(parsed.tool, parsed.args).catch((e) => ({
+      ok: false,
+      output: String(e?.message ?? e),
+    }));
 
     args.conversation.steps.push({
       step,
@@ -475,7 +700,165 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
 }
 
 // ---------------------------------------------------------------
-// Tools
+// Raw-write chunk handling
+// ---------------------------------------------------------------
+
+function handleRawChunk(
+  raw: string,
+  state: WriteState,
+  filePath: string,
+): ChunkOutcome {
+  // A JSON tool call in raw mode means the model forgot the handshake.
+  if (looksLikeToolCall(raw)) {
+    return {
+      kind: "error",
+      code: "TOOL_CALL_GUARD",
+      message:
+        "Expected raw file contents, got a JSON tool call. " +
+        "Call request_write again, then send the raw contents.",
+    };
+  }
+
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+  const last = lines.length ? lines[lines.length - 1].trim() : "";
+
+  let isMore = false;
+  if (last === SENTINEL_MORE) {
+    isMore = true;
+  } else if (last !== SENTINEL_END) {
+    return {
+      kind: "error",
+      code: "MISSING_SENTINEL",
+      message:
+        `Missing ${SENTINEL_END} line, nothing was written ` +
+        `(the reply may have been cut off). Call request_write again ` +
+        `and send the file in chunks of ~300 lines.`,
+    };
+  }
+  lines.pop(); // remove the sentinel line
+
+  // Strip a code fence only if it wraps the entire chunk, and never for
+  // markdown files (where fences are legitimate content).
+  if (
+    !/\.mdx?$/i.test(filePath) &&
+    lines.length >= 2 &&
+    /^```/.test(lines[0].trim()) &&
+    lines[lines.length - 1].trim() === "```"
+  ) {
+    lines.shift();
+    lines.pop();
+  }
+
+  const body = lines.length ? lines.join("\n") + "\n" : "";
+  const buf = Buffer.from(body, "utf8");
+
+  if (buf.length > MAX_CHUNK_BYTES) {
+    return {
+      kind: "error",
+      code: "CHUNK_TOO_LARGE",
+      message: `chunk too large (${buf.length} bytes). Split it.`,
+    };
+  }
+  if (state.bytesTotal + buf.length > MAX_FILE_BYTES) {
+    return {
+      kind: "error",
+      code: "FILE_TOO_LARGE",
+      message: "file too large. Finish as blocked.",
+    };
+  }
+
+  state.chunks.push(buf);
+  state.bytesTotal += buf.length;
+  return isMore ? { kind: "more" } : { kind: "end" };
+}
+
+/**
+ * Detect a forgotten-handshake pattern: the model, still in raw-write mode,
+ * emitted our exact tool-call envelope instead of file contents.
+ *
+ * This is deliberately strict. It matches only:
+ *   - valid JSON
+ *   - a top-level object
+ *   - exactly three keys named reasoning, tool, args
+ *   - reasoning: string, tool: one of TOOL_NAMES, args: object (not array)
+ *
+ * Legitimate file content will rarely satisfy all of these at once. The
+ * narrow collision case is documented in the test plan.
+ */
+function looksLikeToolCall(raw: string): boolean {
+  const trimmed = raw.trim();
+
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return false;
+  }
+
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return false;
+  }
+
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return false;
+  }
+
+  const record = obj as Record<string, unknown>;
+  const keys = Object.keys(record);
+
+  if (keys.length !== 3) return false;
+  if (
+    !keys.includes("reasoning") ||
+    !keys.includes("tool") ||
+    !keys.includes("args")
+  ) {
+    return false;
+  }
+
+  if (typeof record.reasoning !== "string") return false;
+  if (typeof record.tool !== "string") return false;
+
+  if (
+    typeof record.args !== "object" ||
+    record.args === null ||
+    Array.isArray(record.args)
+  ) {
+    return false;
+  }
+
+  return TOOL_NAMES.has(record.tool);
+}
+
+/**
+ * Write raw bytes as the agent user.
+ */
+async function writeAsAgentBytes(
+  destPath: string,
+  contents: Buffer,
+): Promise<{ ok: boolean; output: string }> {
+  const full = safePath(destPath);
+  await asAgent("mkdir", ["-p", path.dirname(full)]);
+
+  return new Promise((resolve) => {
+    const child = spawn("sudo", ["-u", AGENT_USER, "tee", full], {
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("error", (err) =>
+      resolve({ ok: false, output: `tee error: ${err.message}` }),
+    );
+    child.on("close", (code) => {
+      if (code === 0) resolve({ ok: true, output: `wrote ${full}` });
+      else resolve({ ok: false, output: `tee exit ${code}: ${stderr}` });
+    });
+    child.stdin.end(contents);
+  });
+}
+
+// ---------------------------------------------------------------
+// Tools (non-write)
 // ---------------------------------------------------------------
 
 async function runTool(
@@ -488,11 +871,6 @@ async function runTool(
       const { stdout, stderr, code } = await asAgent("cat", [p]);
       if (code !== 0) return { ok: false, output: stderr };
       return { ok: true, output: stdout };
-    }
-    case "write_file": {
-      const p = safePath(String(args.path));
-      await asAgent("mkdir", ["-p", path.dirname(p)]);
-      return await writeAsAgent(p, String(args.contents ?? ""));
     }
     case "run_bash": {
       const cmd = String(args.command ?? "");
@@ -530,27 +908,6 @@ async function runTool(
   }
 }
 
-async function writeAsAgent(
-  destPath: string,
-  contents: string,
-): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    const child = spawn("sudo", ["-u", AGENT_USER, "tee", destPath], {
-      stdio: ["pipe", "ignore", "pipe"],
-    });
-    let stderr = "";
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", (err) =>
-      resolve({ ok: false, output: `tee error: ${err.message}` }),
-    );
-    child.on("close", (code) => {
-      if (code === 0) resolve({ ok: true, output: `wrote ${destPath}` });
-      else resolve({ ok: false, output: `tee exit ${code}: ${stderr}` });
-    });
-    child.stdin.end(contents);
-  });
-}
-
 // ---------------------------------------------------------------
 // Ignore list
 // ---------------------------------------------------------------
@@ -565,7 +922,7 @@ async function readIgnorePatternsAtStartup(): Promise<string[]> {
       out.push(trimmed);
     }
   } catch {
-    // default file not present
+    // no default file
   }
   return out;
 }
@@ -581,7 +938,7 @@ async function readRepoIgnorePatterns(): Promise<string[]> {
       out.push(trimmed);
     }
   } catch {
-    // no repo-specific ignore file
+    // no repo-specific file
   }
   return out;
 }
@@ -1241,6 +1598,7 @@ async function callModel(
   ai: ReturnType<typeof makeModel>,
   systemPrompt: string,
   history: Message[],
+  jsonMode: boolean,
 ): Promise<string> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
@@ -1250,8 +1608,8 @@ async function callModel(
         contents: history,
         config: {
           systemInstruction: systemPrompt,
-          responseMimeType: "application/json",
-          //temperature: 0.2,
+          temperature: 0.2,
+          ...(jsonMode ? { responseMimeType: "application/json" } : {}),
         },
       });
       return response.text ?? "";
@@ -1420,6 +1778,11 @@ async function getRepo(client: any, fullName: string) {
 // ---------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------
+
+function extractPromptVersion(prompt: string): string {
+  const m = prompt.match(/Omah system prompt[^\n]*?v(\d+(?:\.\d+)?)/i);
+  return m ? `v${m[1]}` : "unversioned";
+}
 
 function requireEnv(name: string): string {
   const v = process.env[name];
