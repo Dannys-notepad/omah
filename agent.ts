@@ -878,25 +878,26 @@ async function runTool(
       return { ok: true, output: stdout };
     }
     case "run_bash": {
-      const cmd = String(args.command ?? "");
-      if (!cmd) return { ok: false, output: "empty command" };
-      const { stdout, stderr, code } = await asAgent("bash", ["-c", cmd]);
-      if (
-        code === 124 ||
-        code === 126 ||
-        code === 127 ||
-        stderr.startsWith("sudo failure:")
-      ) {
-        return {
-          ok: false,
-          output: `tool failure (exit ${code})\nstdout:\n${stdout}\nstderr:\n${stderr}`,
-        };
-      }
-      return {
-        ok: true,
-        output: `exit ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
-      };
-    }
+  const cmd = String(args.command ?? "");
+  if (!cmd) return { ok: false, output: "empty command" };
+
+  const result = await runBashWithDetach(cmd);
+  if (
+    result.code === 124 ||
+    result.code === 126 ||
+    result.code === 127 ||
+    result.stderr.startsWith("sudo failure:")
+  ) {
+    return {
+      ok: false,
+      output: `tool failure (exit ${result.code})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    };
+  }
+  return {
+    ok: true,
+    output: `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  };
+}
     case "git_commit": {
       const msg = String(args.message ?? "omah: changes");
       await asAgent("git", ["add", "-A"]);
@@ -911,6 +912,83 @@ async function runTool(
     default:
       return { ok: false, output: `unknown tool: ${tool}` };
   }
+}
+
+
+/**
+ * Run a bash command as the agent user. Unlike a plain execFile, this does
+ * not block forever if the command backgrounds a detached child that keeps
+ * the pipe open. Instead:
+ *
+ *   - We collect stdout/stderr as they arrive.
+ *   - After the top-level shell exits, we give it a short grace period
+ *     (2s) for any remaining output to flush.
+ *   - Then we force-close the pipes and resolve.
+ *
+ * This is what allows commands like `setsid ... & disown; echo done` to
+ * return promptly, without waiting for the detached grandchild to exit.
+ */
+async function runBashWithDetach(
+  cmd: string,
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      "sudo",
+      [
+        "-u",
+        AGENT_USER,
+        "env",
+        `PATH=${process.env.PATH}`,
+        `HOME=${AGENT_HOME}`,
+        `XDG_CONFIG_HOME=${AGENT_HOME}/.config`,
+        `NPM_CONFIG_CACHE=${AGENT_HOME}/.npm`,
+        "bash",
+        "-c",
+        cmd,
+      ],
+      {
+        cwd: WORKSPACE,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+    let exitCode: number | null = null;
+    let resolved = false;
+
+    const finish = (code: number) => {
+      if (resolved) return;
+      resolved = true;
+      resolve({ stdout, stderr, code });
+    };
+
+    child.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+
+    child.on("error", (err) => {
+      stderr += `\nspawn error: ${err.message}`;
+      finish(1);
+    });
+
+    child.on("close", (code) => {
+      exitCode = code ?? 0;
+      // Give pipes a brief moment to flush any buffered output, then resolve.
+      setTimeout(() => finish(exitCode ?? 0), 2000);
+    });
+
+    // Belt-and-suspenders: hard cap at 5 minutes.
+    setTimeout(() => {
+      if (!resolved) {
+        child.kill("SIGTERM");
+        finish(exitCode ?? 124);
+      }
+    }, 5 * 60 * 1000);
+  });
 }
 
 // ---------------------------------------------------------------
