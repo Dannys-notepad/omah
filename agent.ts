@@ -28,7 +28,7 @@
 //   APP_PRIVATE_KEY    GitHub App private key (PEM)
 //   APP_BOT_ID         GitHub App bot user ID (required)
 
-import { promises as fs, appendFileSync } from "node:fs";
+import { promises as fs, appendFileSync, readFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createSign } from "node:crypto";
@@ -317,7 +317,12 @@ async function main(): Promise<void> {
 
   await saveConversation(conversation, targetRepo, appToken);
 
-  await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
+  try {
+  await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
+} catch {
+  // Only exists during the hostile test; ignore failures in production.
+}
+await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
 
   const prUrl = await pushPatchAndOpenPR({
     appToken,
@@ -1594,12 +1599,53 @@ function makeModel(key: string) {
   return new GoogleGenAI({ apiKey: key });
 }
 
+// ---------------------------------------------------------------
+// Scripted-provider mode (hostile test only)
+// ---------------------------------------------------------------
+
+let scriptedResponses: string[] | null = null;
+let scriptedIndex = 0;
+
+function loadScriptedResponses(): string[] {
+  const p = process.env.OMAH_SCRIPT!;
+  const raw = readFileSync(p, "utf8");
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed?.responses)) {
+    throw new Error("OMAH_SCRIPT: missing 'responses' array");
+  }
+  return parsed.responses.map(String);
+}
+
 async function callModel(
   ai: ReturnType<typeof makeModel>,
   systemPrompt: string,
   history: Message[],
   jsonMode: boolean,
 ): Promise<string> {
+  if (process.env.OMAH_SCRIPT) {
+    if (scriptedResponses === null) {
+      try {
+        scriptedResponses = loadScriptedResponses();
+      } catch (err: any) {
+        throw new Error(`OMAH_SCRIPT load failed: ${err?.message ?? err}`);
+      }
+      await log(`OMAH_SCRIPT: loaded ${scriptedResponses.length} responses`);
+    }
+    if (scriptedIndex >= scriptedResponses.length) {
+      await log("OMAH_SCRIPT: responses exhausted; returning finish(done)");
+      return JSON.stringify({
+        reasoning: "Scripted responses exhausted.",
+        tool: "finish",
+        args: { summary: "Hostile test script exhausted.", status: "done" },
+      });
+    }
+    const reply = scriptedResponses[scriptedIndex++];
+    await log(
+      `OMAH_SCRIPT: returning response ${scriptedIndex}/${scriptedResponses.length}`,
+    );
+    return reply;
+  }
+
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {

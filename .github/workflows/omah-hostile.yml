@@ -106,6 +106,10 @@ jobs:
           APP_BOT_ID: ${{ vars.OMAH_APP_BOT_ID }}
         run: npx tsx agent.ts || echo "AGENT_EXIT=$?" >> "$GITHUB_ENV"
 
+      - name: Kill agent processes
+        if: always()
+        run: sudo pkill -9 -u omah-runner || true
+
       - name: Check
         run: |
           sudo bash test/check.sh
