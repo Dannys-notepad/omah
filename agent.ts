@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 
 const WALL_CLOCK_MS = 15 * 60 * 1000;
 const MAX_CONSECUTIVE_ERRORS = 3;
-const MAX_LLM_RETRIES = 3;
+const MAX_LLM_RETRIES = 6;
 const MAX_PATCH_BYTES = 5 * 1024 * 1024;
 const MAX_PR_BODY_CHARS = 60_000;
 const MAX_BASH_OUT = 1_000_000;
@@ -516,7 +516,17 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
           status: "blocked",
         };
       }
-      throw err;
+
+      // Non-quota error that survived retries. Return blocked instead of
+      // crashing the whole run so we produce a diagnosable artifact.
+      const msg = String((err as any)?.message ?? err).slice(0, 300);
+      const is503 = /503|UNAVAILABLE|high demand/i.test(msg);
+      const label = is503 ? "Gemini unavailable (503)" : "LLM call failed";
+      await log(`blocking: ${label}: ${msg}`);
+      return {
+        summary: `${label}: ${msg}`,
+        status: "blocked",
+      };
     }
 
     if (writeState) {
@@ -1734,7 +1744,15 @@ async function callModel(
       }
 
       if (!isRetryableError(err)) throw err;
-      await sleep(1000 * Math.pow(2, attempt));
+
+      // Backoff: 2s, 4s, 8s, 16s, 32s. Total ~62s before giving up.
+      const delay = 2000 * Math.pow(2, attempt);
+      await log(
+        `retry ${attempt + 1}/${MAX_LLM_RETRIES} after ${delay}ms: ${String(
+          (err as any)?.message ?? err,
+        ).slice(0, 120)}`,
+      );
+      await sleep(delay);
     }
   }
   throw lastErr;
