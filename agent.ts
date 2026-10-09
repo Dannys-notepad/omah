@@ -1,23 +1,5 @@
 // agent.ts
 // The Omah agent loop. Runs inside a GitHub Actions runner.
-//
-// Security model:
-//   - The workspace is UNTRUSTED. The agent (omah-runner) controls it.
-//   - No authenticated git operation ever runs inside the workspace.
-//   - The agent generates a patch; the orchestrator (runner) applies it
-//     to a fresh clone and pushes from there.
-//   - Tokens are passed via environment variables, never via command-line
-//     arguments (which are visible in /proc/<pid>/cmdline to all users).
-//
-// Write model (v2):
-//   File contents never travel inside JSON. The model calls request_write(path),
-//   the harness asks for raw content, the model emits raw text (optionally split
-//   across chunks with sentinel lines), and the harness assembles and writes.
-//
-// Environment:
-//   INPUT_REPO, INPUT_TASK, INPUT_BASE_BRANCH, INPUT_RESUME, INPUT_BRANCH,
-//   INPUT_RESUME_TEXT, GEMINI_KEYS, APP_ID, APP_PRIVATE_KEY, APP_BOT_ID
-//   OMAH_SCRIPT  (hostile test only: path to JSON with canned replies)
 
 import { promises as fs, appendFileSync, readFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
@@ -124,6 +106,57 @@ type ChunkOutcome =
   | { kind: "end" }
   | { kind: "error"; code: ChunkErrorCode; message: string };
 
+interface UsageInfo {
+  input: number;
+  output: number;
+  thoughts: number;
+  ms: number;
+  keyIndex: number;
+}
+
+interface KeyStat {
+  calls: number;
+  rate429: number;
+  errors: number;
+  lastError?: string;
+}
+
+interface StepUsage {
+  step: number;
+  input: number;
+  output: number;
+  thoughts: number;
+  ms: number;
+  tool: string;
+}
+
+// ---------------------------------------------------------------
+// Usage tracking
+// ---------------------------------------------------------------
+
+const usageLog: StepUsage[] = [];
+const keyStats: Map<number, KeyStat> = new Map();
+
+function recordKeyCall(keyIndex: number): void {
+  const s = keyStats.get(keyIndex) ?? { calls: 0, rate429: 0, errors: 0 };
+  s.calls += 1;
+  keyStats.set(keyIndex, s);
+}
+
+function recordKeyRateLimit(keyIndex: number, message: string): void {
+  const s = keyStats.get(keyIndex) ?? { calls: 0, rate429: 0, errors: 0 };
+  s.rate429 += 1;
+  s.lastError = message.slice(0, 300);
+  keyStats.set(keyIndex, s);
+}
+
+function recordKeyError(keyIndex: number, message: string): void {
+  const s = keyStats.get(keyIndex) ?? { calls: 0, rate429: 0, errors: 0 };
+  s.errors += 1;
+  s.lastError = message.slice(0, 300);
+  keyStats.set(keyIndex, s);
+}
+
 // ---------------------------------------------------------------
 // Process helpers
 // ---------------------------------------------------------------
@@ -212,6 +245,10 @@ function gitAuthEnv(token: string): Record<string, string> {
 // ---------------------------------------------------------------
 
 async function main(): Promise<void> {
+  const runStarted = Date.now();
+  let setupMs = 0;
+  let pushMs = 0;
+
   await fs.mkdir(OMAH_ROOT, { recursive: true, mode: 0o755 });
 
   const targetRepo = requireEnv("INPUT_REPO");
@@ -283,6 +320,8 @@ async function main(): Promise<void> {
   const startSha = startShaOut.trim();
   await log(`startSha=${startSha}`);
 
+  setupMs = Date.now() - runStarted;
+
   const systemPrompt = await fs.readFile(SYSTEM_PROMPT_PATH, "utf8");
   const keys = loadKeys();
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
@@ -314,6 +353,7 @@ async function main(): Promise<void> {
   }
   await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
 
+  const pushStart = Date.now();
   const prUrl = await pushPatchAndOpenPR({
     appToken,
     targetRepo,
@@ -325,11 +365,23 @@ async function main(): Promise<void> {
     botEmail,
     ignorePatterns: mergedPatterns,
   });
+  pushMs = Date.now() - pushStart;
 
   if (prUrl) {
     setOutput("pr_url", prUrl);
   }
   setOutput("status", result.status);
+
+  const llmMs = usageLog.reduce((a, u) => a + u.ms, 0);
+  writeRunSummary(
+    buildUsageSummary({
+      totalMs: Date.now() - runStarted,
+      llmMs,
+      setupMs,
+      pushMs,
+      keysTotal: keys.length,
+    }),
+  );
 
   await log(`done. pr=${prUrl || "(none)"} status=${result.status}`);
 }
@@ -427,12 +479,28 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
     const model = makeModel(args.keys[keyIndex]);
 
     let responseText: string;
+    const stepForLog = args.conversation.steps.length + 1;
     try {
-      responseText = await callModel(
+      const result = await callModel(
         model,
         args.systemPrompt,
         history,
         writeState === null,
+        keyIndex,
+      );
+      responseText = result.text;
+      usageLog.push({
+        step: stepForLog,
+        input: result.usage.input,
+        output: result.usage.output,
+        thoughts: result.usage.thoughts,
+        ms: result.usage.ms,
+        tool: "(pending)",
+      });
+      await log(
+        `[step ${stepForLog}] llm: in=${result.usage.input} out=${result.usage.output}` +
+          (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
+          ` ms=${result.usage.ms} key=${keyIndex + 1}`,
       );
     } catch (err) {
       const quotaHit = isQuotaError(err);
@@ -577,6 +645,11 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
 
     const step = args.conversation.steps.length + 1;
     await log(`[step ${step}] ${parsed.tool}`);
+
+    if (usageLog.length > 0) {
+      const last = usageLog[usageLog.length - 1];
+      if (last.tool === "(pending)") last.tool = parsed.tool;
+    }
 
     if (parsed.tool === "finish") {
       const summary = String(parsed.args.summary ?? "");
@@ -792,7 +865,7 @@ async function writeAsAgentBytes(
 }
 
 // ---------------------------------------------------------------
-// Tools (non-write)
+// Tools
 // ---------------------------------------------------------------
 
 async function runTool(
@@ -1592,7 +1665,8 @@ async function callModel(
   systemPrompt: string,
   history: Message[],
   jsonMode: boolean,
-): Promise<string> {
+  keyIndex: number,
+): Promise<{ text: string; usage: UsageInfo }> {
   if (process.env.OMAH_SCRIPT) {
     if (scriptedResponses === null) {
       try {
@@ -1604,21 +1678,28 @@ async function callModel(
     }
     if (scriptedIndex >= scriptedResponses.length) {
       await log("OMAH_SCRIPT: responses exhausted; returning finish(done)");
-      return JSON.stringify({
-        reasoning: "Scripted responses exhausted.",
-        tool: "finish",
-        args: { summary: "Hostile test script exhausted.", status: "done" },
-      });
+      return {
+        text: JSON.stringify({
+          reasoning: "Scripted responses exhausted.",
+          tool: "finish",
+          args: { summary: "Hostile test script exhausted.", status: "done" },
+        }),
+        usage: { input: 0, output: 0, thoughts: 0, ms: 0, keyIndex },
+      };
     }
     const reply = scriptedResponses[scriptedIndex++];
     await log(
       `OMAH_SCRIPT: returning response ${scriptedIndex}/${scriptedResponses.length}`,
     );
-    return reply;
+    return {
+      text: reply,
+      usage: { input: 0, output: 0, thoughts: 0, ms: 0, keyIndex },
+    };
   }
 
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
+    const started = Date.now();
     try {
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
@@ -1629,9 +1710,29 @@ async function callModel(
           ...(jsonMode ? { responseMimeType: "application/json" } : {}),
         },
       });
-      return response.text ?? "";
-    } catch (err) {
+
+      const elapsed = Date.now() - started;
+      recordKeyCall(keyIndex);
+
+      const um: any = (response as any).usageMetadata ?? {};
+      const usage: UsageInfo = {
+        input: Number(um.promptTokenCount ?? 0),
+        output: Number(um.candidatesTokenCount ?? 0),
+        thoughts: Number(um.thoughtsTokenCount ?? 0),
+        ms: elapsed,
+        keyIndex,
+      };
+
+      return { text: response.text ?? "", usage };
+    } catch (err: any) {
       lastErr = err;
+
+      if (isQuotaError(err)) {
+        recordKeyRateLimit(keyIndex, String(err?.message ?? err));
+      } else if (!isRetryableError(err)) {
+        recordKeyError(keyIndex, String(err?.message ?? err));
+      }
+
       if (!isRetryableError(err)) throw err;
       await sleep(1000 * Math.pow(2, attempt));
     }
@@ -1648,6 +1749,77 @@ function isQuotaError(err: any): boolean {
   const code = err?.status ?? err?.code ?? err?.response?.status;
   const msg = String(err?.message ?? "");
   return code === 429 || /quota|rate limit/i.test(msg);
+}
+
+// ---------------------------------------------------------------
+// Usage summary
+// ---------------------------------------------------------------
+
+function buildUsageSummary(args: {
+  totalMs: number;
+  llmMs: number;
+  setupMs: number;
+  pushMs: number;
+  keysTotal: number;
+}): string {
+  const steps = usageLog.length;
+  const sumIn = usageLog.reduce((a, u) => a + u.input, 0);
+  const sumOut = usageLog.reduce((a, u) => a + u.output, 0);
+  const sumThoughts = usageLog.reduce((a, u) => a + u.thoughts, 0);
+
+  const lines: string[] = [];
+  lines.push("## Omah run diagnostics");
+  lines.push("");
+  lines.push(`- Steps: ${steps}`);
+  lines.push(`- LLM calls: ${steps}`);
+  lines.push(
+    `- Tokens: input=${sumIn.toLocaleString()} output=${sumOut.toLocaleString()}` +
+      (sumThoughts ? ` thoughts=${sumThoughts.toLocaleString()}` : ""),
+  );
+  lines.push(
+    `- Wall time: total=${Math.round(args.totalMs / 1000)}s ` +
+      `llm=${Math.round(args.llmMs / 1000)}s ` +
+      `setup=${Math.round(args.setupMs / 1000)}s ` +
+      `push=${Math.round(args.pushMs / 1000)}s`,
+  );
+  const toolMs = args.totalMs - args.llmMs - args.setupMs - args.pushMs;
+  lines.push(`- Tool time: ${Math.round(toolMs / 1000)}s`);
+
+  lines.push("");
+  lines.push("### Per key");
+  lines.push("");
+  lines.push("| key | calls | 429 | errors | last error |");
+  lines.push("|---|---|---|---|---|");
+  for (let i = 0; i < args.keysTotal; i++) {
+    const s = keyStats.get(i) ?? { calls: 0, rate429: 0, errors: 0 };
+    const err = s.lastError
+      ? s.lastError.replace(/\|/g, "\\|").slice(0, 100)
+      : "";
+    lines.push(`| ${i + 1} | ${s.calls} | ${s.rate429} | ${s.errors} | ${err} |`);
+  }
+
+  lines.push("");
+  lines.push("### Input tokens per step");
+  lines.push("");
+  lines.push("| step | tool | input | output | thoughts | ms |");
+  lines.push("|---|---|---|---|---|---|");
+  for (const u of usageLog) {
+    lines.push(
+      `| ${u.step} | ${u.tool} | ${u.input} | ${u.output} | ${u.thoughts || ""} | ${u.ms} |`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function writeRunSummary(text: string): void {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (!file) return;
+  try {
+    appendFileSync(file, text + "\n");
+  } catch {
+    // Best-effort.
+  }
 }
 
 // ---------------------------------------------------------------
