@@ -518,15 +518,19 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       }
 
       // Non-quota error that survived retries. Return blocked instead of
-      // crashing the whole run so we produce a diagnosable artifact.
-      const msg = String((err as any)?.message ?? err).slice(0, 300);
-      const is503 = /503|UNAVAILABLE|high demand/i.test(msg);
-      const label = is503 ? "Gemini unavailable (503)" : "LLM call failed";
-      await log(`blocking: ${label}: ${msg}`);
-      return {
-        summary: `${label}: ${msg}`,
-        status: "blocked",
-      };
+// crashing the whole run so we produce a diagnosable artifact.
+const errAny = err as any;
+const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(0, 300);
+const statusCode = errAny?.status ?? errAny?.code ?? errAny?.response?.status;
+const is503 = statusCode === 503 || /503|UNAVAILABLE|high demand/i.test(msg);
+const label = is503
+  ? "LLM unavailable (503)"
+  : `LLM call failed (status=${statusCode ?? "unknown"})`;
+await log(`blocking: ${label}: ${msg}`);
+return {
+  summary: `${label}: ${msg}`,
+  status: "blocked",
+};
     }
 
     if (writeState) {
