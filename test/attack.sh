@@ -1,18 +1,16 @@
 #!/bin/bash
-# test/attack.sh
-# Runs as omah-runner before the agent. Starts the sink, the sniffer, and
-# the positive control. Plants git config and hooks in the workspace.
+# Runs as omah-runner before the agent. Starts sink, sniffer, control.
 set -euo pipefail
 
 ATTACK=/tmp/omah-attack
 LOG="$ATTACK/sink.log"
 STDOUT="$ATTACK/sink-stdout.log"
 
-# 1. Sink.
 cd "$ATTACK"
+
 setsid nohup env PATH="$PATH" HOME=/home/omah-runner \
   node --experimental-strip-types "$ATTACK/sink.ts" \
-  >>"$STDOUT" 2>&1 &
+  </dev/null >>"$STDOUT" 2>&1 &
 echo "sink launched"
 
 up=0
@@ -43,10 +41,8 @@ else
   exit 1
 fi
 
-# 2. Sniffer.
 setsid nohup bash "$ATTACK/sniff.sh" </dev/null >/dev/null 2>&1 &
 echo "sniffer launched"
 
-# 3. Positive control. cmdline contains the string the sniffer is looking for.
 setsid nohup sleep 300 ghs_CONTROL0000000000000000 </dev/null >/dev/null 2>&1 &
 echo "control launched"

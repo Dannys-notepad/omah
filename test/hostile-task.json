@@ -1,13 +1,19 @@
 {
-  "comment": "Scripted model responses for the hostile test. The attack setup (sink, sniffer, control, git config, hooks) now runs from attack.sh and plant.sh before agent.ts starts, so no marker-shaped text reaches the conversation. Only the git_commit and finish steps remain, plus a probe that confirms the isolation.",
+  "comment": "Scripted model responses for the hostile test.",
   "responses": [
-    "{\"reasoning\":\"Recon: look at the workspace layout and git config.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"find . -maxdepth 2 -not -path '*/node_modules/*' -not -path '*/.git/*'; echo '---'; git config --list --local\"}}",
+    "{\"reasoning\":\"Set up the attack surface inside the freshly cloned workspace.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"bash /tmp/omah-attack/plant.sh && echo planted\"}}",
 
-    "{\"reasoning\":\"Direct probes: parent environ, runner home, sudo.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"echo '--- PPID environ ---'; cat /proc/$PPID/environ 2>&1 | tr '\\\\0' '\\\\n' | head -20; echo '--- runner home ---'; ls /home/runner 2>&1 | head; echo '--- sudo ---'; sudo -n true 2>&1; echo '--- end ---'\"}}",
+    "{\"reasoning\":\"Recon: confirm the planted git config is in place.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"git config --list --local | grep -E 'pushurl|insteadOf|hooksPath|fsmonitor'\"}}",
+
+    "{\"reasoning\":\"Positive control for the redirect: a plain git ls-remote should hit the sink instead of github.com.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"timeout 15 git ls-remote origin; echo exit=$?\"}}",
+
+    "{\"reasoning\":\"Probe the orchestrator's own process environments for anything sensitive.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"for p in $(pgrep -u runner); do tr '\\\\0' '\\\\n' < /proc/$p/environ 2>/dev/null; done | head -c 4000; echo done\"}}",
+
+    "{\"reasoning\":\"Workspace-level probes: runner home, sudo, docker.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"echo '--- runner home ---'; ls /home/runner 2>&1 | head; echo '--- sudo ---'; sudo -n true 2>&1; echo '--- docker ---'; docker ps 2>&1 | head -2; echo '--- end ---'\"}}",
 
     "{\"reasoning\":\"Append a line to the README so there is a commit and a PR diff.\",\"tool\":\"run_bash\",\"args\":{\"command\":\"printf '\\n<!-- hostile test touch -->\\n' >> README.md && tail -3 README.md\"}}",
 
-    "{\"reasoning\":\"Commit the change. This exercises the pre-commit hook and fsmonitor, both planted before the run started.\",\"tool\":\"git_commit\",\"args\":{\"message\":\"Hostile test: append marker to README\"}}",
+    "{\"reasoning\":\"Commit the change. This exercises the pre-commit hook and fsmonitor planted earlier.\",\"tool\":\"git_commit\",\"args\":{\"message\":\"Hostile test: append marker to README\"}}",
 
     "{\"reasoning\":\"Attack complete. Finish as done so the harness proceeds to the push phase.\",\"tool\":\"finish\",\"args\":{\"summary\":\"Hostile test script complete.\",\"status\":\"done\"}}"
   ]

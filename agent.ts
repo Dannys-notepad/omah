@@ -13,20 +13,11 @@
 //   File contents never travel inside JSON. The model calls request_write(path),
 //   the harness asks for raw content, the model emits raw text (optionally split
 //   across chunks with sentinel lines), and the harness assembles and writes.
-//   This eliminates a class of parse failures caused by raw newlines and
-//   unescaped quotes inside JSON strings.
 //
-// Environment (set by the workflow):
-//   INPUT_REPO         target repo, "owner/name"
-//   INPUT_TASK         the user's prompt (only for new tasks)
-//   INPUT_BASE_BRANCH  optional base branch (defaults to repo default)
-//   INPUT_RESUME       "true" to resume, otherwise unset
-//   INPUT_BRANCH       branch name (required when resuming)
-//   INPUT_RESUME_TEXT  the user's follow-up instruction (required when resuming)
-//   GEMINI_KEYS        JSON array of Gemini API keys
-//   APP_ID             GitHub App ID
-//   APP_PRIVATE_KEY    GitHub App private key (PEM)
-//   APP_BOT_ID         GitHub App bot user ID (required)
+// Environment:
+//   INPUT_REPO, INPUT_TASK, INPUT_BASE_BRANCH, INPUT_RESUME, INPUT_BRANCH,
+//   INPUT_RESUME_TEXT, GEMINI_KEYS, APP_ID, APP_PRIVATE_KEY, APP_BOT_ID
+//   OMAH_SCRIPT  (hostile test only: path to JSON with canned replies)
 
 import { promises as fs, appendFileSync, readFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
@@ -48,16 +39,14 @@ const MAX_CONSECUTIVE_ERRORS = 3;
 const MAX_LLM_RETRIES = 3;
 const MAX_PATCH_BYTES = 5 * 1024 * 1024;
 const MAX_PR_BODY_CHARS = 60_000;
+const MAX_BASH_OUT = 1_000_000;
 
-// Write limits (in bytes; the prompt talks in lines).
-const MAX_CHUNK_BYTES = 200 * 1024;      // soft cap per chunk
-const MAX_FILE_BYTES = 500 * 1024;       // hard cap per file
+const MAX_CHUNK_BYTES = 200 * 1024;
+const MAX_FILE_BYTES = 500 * 1024;
 
-// Sentinels for chunked writes.
 const SENTINEL_MORE = "<<<OMAH_MORE>>>";
 const SENTINEL_END = "<<<OMAH_END>>>";
 
-// Known tool names for the forgotten-handshake guard.
 const TOOL_NAMES = new Set<string>([
   "read_file",
   "request_write",
@@ -118,7 +107,6 @@ interface ExecResult {
   code: number;
 }
 
-// State for a chunked write in progress.
 interface WriteState {
   path: string;
   chunks: Buffer[];
@@ -137,7 +125,7 @@ type ChunkOutcome =
   | { kind: "error"; code: ChunkErrorCode; message: string };
 
 // ---------------------------------------------------------------
-// Helpers: run commands
+// Process helpers
 // ---------------------------------------------------------------
 
 async function asAgent(
@@ -265,7 +253,7 @@ async function main(): Promise<void> {
 
   await log(`task=${taskId} repo=${targetRepo} base=${baseBranch}`);
   await log(`branch=${branchName} resume=${resume}`);
-  setOutput("branch", branchName);setOutput("branch", branchName);
+  setOutput("branch", branchName);
 
   const conversation: Conversation = resume
     ? await loadConversation(targetRepo, branchName, appToken)
@@ -296,7 +284,6 @@ async function main(): Promise<void> {
   await log(`startSha=${startSha}`);
 
   const systemPrompt = await fs.readFile(SYSTEM_PROMPT_PATH, "utf8");
-  await log(`system prompt: ${extractPromptVersion(systemPrompt)}`);
   const keys = loadKeys();
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
 
@@ -318,12 +305,14 @@ async function main(): Promise<void> {
 
   await saveConversation(conversation, targetRepo, appToken);
 
-  try {
-  await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
-} catch {
-  // Only exists during the hostile test; ignore failures in production.
-}
-await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
+  if (process.env.OMAH_SCRIPT) {
+    try {
+      await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
+    } catch {
+      // Hostile-test only; ignore failures.
+    }
+  }
+  await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
 
   const prUrl = await pushPatchAndOpenPR({
     appToken,
@@ -372,12 +361,10 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
   let consecutiveErrors = 0;
   let keyIndex = 0;
 
-  // Write state: set when we've asked the model for raw file content.
   let writeState: WriteState | null = null;
   let pendingWriteReasoning = "";
   let pendingWritePath = "";
 
-  // Replay prior steps on resume.
   if (args.conversation.steps.length > 0) {
     history.push({
       role: "user",
@@ -464,7 +451,6 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       throw err;
     }
 
-    // ---------- Raw write mode ----------
     if (writeState) {
       const outcome = handleRawChunk(responseText, writeState, writeState.path);
 
@@ -500,7 +486,10 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       }
 
       if (outcome.kind === "more") {
-        history.push({ role: "model", parts: [{ text: responseText }] });
+        history.push({
+          role: "model",
+          parts: [{ text: `[raw file chunk for ${writeState.path}]` }],
+        });
         history.push({
           role: "user",
           parts: [
@@ -514,7 +503,6 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         continue;
       }
 
-      // outcome.kind === "end": assemble and write the file.
       const contents = Buffer.concat(writeState.chunks);
       const writeResult = await writeAsAgentBytes(writeState.path, contents);
 
@@ -567,7 +555,6 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       continue;
     }
 
-    // ---------- Normal JSON mode ----------
     const parsed = parseModelOutput(responseText);
     if (!parsed) {
       await log(`could not parse model output (${responseText.length} chars):`);
@@ -605,7 +592,6 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       return { summary, status };
     }
 
-    // request_write: enter raw mode instead of executing a tool.
     if (parsed.tool === "request_write") {
       const p = String(parsed.args.path ?? "");
       if (!p) {
@@ -624,7 +610,6 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         continue;
       }
 
-      // Validate the path before the model spends tokens writing content.
       try {
         safePath(p);
       } catch (err: any) {
@@ -714,7 +699,6 @@ function handleRawChunk(
   state: WriteState,
   filePath: string,
 ): ChunkOutcome {
-  // A JSON tool call in raw mode means the model forgot the handshake.
   if (looksLikeToolCall(raw)) {
     return {
       kind: "error",
@@ -742,10 +726,8 @@ function handleRawChunk(
         `and send the file in chunks of ~300 lines.`,
     };
   }
-  lines.pop(); // remove the sentinel line
+  lines.pop();
 
-  // Strip a code fence only if it wraps the entire chunk, and never for
-  // markdown files (where fences are legitimate content).
   if (
     !/\.mdx?$/i.test(filePath) &&
     lines.length >= 2 &&
@@ -779,66 +761,12 @@ function handleRawChunk(
   return isMore ? { kind: "more" } : { kind: "end" };
 }
 
-/**
- * Detect a forgotten-handshake pattern: the model, still in raw-write mode,
- * emitted our exact tool-call envelope instead of file contents.
- *
- * This is deliberately strict. It matches only:
- *   - valid JSON
- *   - a top-level object
- *   - exactly three keys named reasoning, tool, args
- *   - reasoning: string, tool: one of TOOL_NAMES, args: object (not array)
- *
- * Legitimate file content will rarely satisfy all of these at once. The
- * narrow collision case is documented in the test plan.
- */
 function looksLikeToolCall(raw: string): boolean {
-  const trimmed = raw.trim();
-
-  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
-    return false;
-  }
-
-  let obj: unknown;
-  try {
-    obj = JSON.parse(trimmed);
-  } catch {
-    return false;
-  }
-
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
-    return false;
-  }
-
-  const record = obj as Record<string, unknown>;
-  const keys = Object.keys(record);
-
-  if (keys.length !== 3) return false;
-  if (
-    !keys.includes("reasoning") ||
-    !keys.includes("tool") ||
-    !keys.includes("args")
-  ) {
-    return false;
-  }
-
-  if (typeof record.reasoning !== "string") return false;
-  if (typeof record.tool !== "string") return false;
-
-  if (
-    typeof record.args !== "object" ||
-    record.args === null ||
-    Array.isArray(record.args)
-  ) {
-    return false;
-  }
-
-  return TOOL_NAMES.has(record.tool);
+  const parsed = parseModelOutput(raw);
+  if (!parsed) return false;
+  return TOOL_NAMES.has(parsed.tool);
 }
 
-/**
- * Write raw bytes as the agent user.
- */
 async function writeAsAgentBytes(
   destPath: string,
   contents: Buffer,
@@ -879,26 +807,25 @@ async function runTool(
       return { ok: true, output: stdout };
     }
     case "run_bash": {
-  const cmd = String(args.command ?? "");
-  if (!cmd) return { ok: false, output: "empty command" };
-
-  const result = await runBashWithDetach(cmd);
-  if (
-    result.code === 124 ||
-    result.code === 126 ||
-    result.code === 127 ||
-    result.stderr.startsWith("sudo failure:")
-  ) {
-    return {
-      ok: false,
-      output: `tool failure (exit ${result.code})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    };
-  }
-  return {
-    ok: true,
-    output: `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-  };
-}
+      const cmd = String(args.command ?? "");
+      if (!cmd) return { ok: false, output: "empty command" };
+      const result = await runBashWithDetach(cmd);
+      if (
+        result.code === 124 ||
+        result.code === 126 ||
+        result.code === 127 ||
+        result.stderr.startsWith("sudo failure:")
+      ) {
+        return {
+          ok: false,
+          output: `tool failure (exit ${result.code})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+        };
+      }
+      return {
+        ok: true,
+        output: `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      };
+    }
     case "git_commit": {
       const msg = String(args.message ?? "omah: changes");
       await asAgent("git", ["add", "-A"]);
@@ -915,20 +842,6 @@ async function runTool(
   }
 }
 
-
-/**
- * Run a bash command as the agent user. Unlike a plain execFile, this does
- * not block forever if the command backgrounds a detached child that keeps
- * the pipe open. Instead:
- *
- *   - We collect stdout/stderr as they arrive.
- *   - After the top-level shell exits, we give it a short grace period
- *     (2s) for any remaining output to flush.
- *   - Then we force-close the pipes and resolve.
- *
- * This is what allows commands like `setsid ... & disown; echo done` to
- * return promptly, without waiting for the detached grandchild to exit.
- */
 async function runBashWithDetach(
   cmd: string,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -947,48 +860,42 @@ async function runBashWithDetach(
         "-c",
         cmd,
       ],
-      {
-        cwd: WORKSPACE,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
+      { cwd: WORKSPACE, stdio: ["ignore", "pipe", "pipe"] },
     );
 
     let stdout = "";
     let stderr = "";
-    let exitCode: number | null = null;
     let resolved = false;
 
-    const finish = (code: number) => {
+    const done = (code: number) => {
       if (resolved) return;
       resolved = true;
+      clearTimeout(timer);
       resolve({ stdout, stderr, code });
     };
 
+    const timer = setTimeout(async () => {
+      child.kill("SIGKILL");
+      await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
+      done(124);
+    }, 5 * 60 * 1000);
+
     child.stdout.on("data", (d: Buffer) => {
-      stdout += d.toString();
+      if (stdout.length < MAX_BASH_OUT) stdout += d.toString();
     });
     child.stderr.on("data", (d: Buffer) => {
-      stderr += d.toString();
+      if (stderr.length < MAX_BASH_OUT) stderr += d.toString();
     });
 
     child.on("error", (err) => {
       stderr += `\nspawn error: ${err.message}`;
-      finish(1);
+      done(1);
     });
 
-    child.on("close", (code) => {
-      exitCode = code ?? 0;
-      // Give pipes a brief moment to flush any buffered output, then resolve.
-      setTimeout(() => finish(exitCode ?? 0), 2000);
+    child.on("exit", (code, sig) => {
+      const finalCode = code ?? (sig ? 137 : 1);
+      setTimeout(() => done(finalCode), 300);
     });
-
-    // Belt-and-suspenders: hard cap at 5 minutes.
-    setTimeout(() => {
-      if (!resolved) {
-        child.kill("SIGTERM");
-        finish(exitCode ?? 124);
-      }
-    }, 5 * 60 * 1000);
   });
 }
 
@@ -1005,9 +912,7 @@ async function readIgnorePatternsAtStartup(): Promise<string[]> {
       if (!trimmed || trimmed.startsWith("#")) continue;
       out.push(trimmed);
     }
-  } catch {
-    // no default file
-  }
+  } catch {}
   return out;
 }
 
@@ -1021,22 +926,16 @@ async function readRepoIgnorePatterns(): Promise<string[]> {
       if (!trimmed || trimmed.startsWith("#")) continue;
       out.push(trimmed);
     }
-  } catch {
-    // no repo-specific file
-  }
+  } catch {}
   return out;
 }
 
 async function applyIgnoreList(patterns: string[]): Promise<void> {
   if (patterns.length === 0) return;
-
   const ig = ignore().add(patterns);
-
   const { stdout: trackedOut } = await asAgent("git", ["ls-files", "-z"]);
   const tracked = new Set(trackedOut.split("\0").filter(Boolean));
-
   const toSkipWorktree: string[] = [];
-
   for (const rel of tracked) {
     if (ig.ignores(rel)) {
       toSkipWorktree.push(rel);
@@ -1044,7 +943,6 @@ async function applyIgnoreList(patterns: string[]): Promise<void> {
       await log(`ignore: removed ${rel}`);
     }
   }
-
   if (toSkipWorktree.length > 0) {
     await asAgent("git", [
       "update-index",
@@ -1241,7 +1139,6 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
   }
 
   const pushClone = await fs.mkdtemp(path.join(OMAH_ROOT, "push-"));
-
   const cloneEnv = gitAuthEnv(args.appToken);
   const url = `https://github.com/${args.targetRepo}.git`;
 
@@ -1355,7 +1252,6 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
   }
 
   await fs.rm(pushClone, { recursive: true, force: true });
-
   return prUrl;
 }
 
@@ -1678,10 +1574,6 @@ function makeModel(key: string) {
   return new GoogleGenAI({ apiKey: key });
 }
 
-// ---------------------------------------------------------------
-// Scripted-provider mode (hostile test only)
-// ---------------------------------------------------------------
-
 let scriptedResponses: string[] | null = null;
 let scriptedIndex = 0;
 
@@ -1840,10 +1732,7 @@ async function mintAppToken(jwt: string, targetRepo: string): Promise<string> {
       },
       body: JSON.stringify({
         repositories: [repo],
-        permissions: {
-          contents: "write",
-          pull_requests: "write",
-        },
+        permissions: { contents: "write", pull_requests: "write" },
       }),
     },
   );
@@ -1903,11 +1792,6 @@ async function getRepo(client: any, fullName: string) {
 // ---------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------
-
-function extractPromptVersion(prompt: string): string {
-  const m = prompt.match(/Omah system prompt[^\n]*?v(\d+(?:\.\d+)?)/i);
-  return m ? `v${m[1]}` : "unversioned";
-}
 
 function requireEnv(name: string): string {
   const v = process.env[name];
