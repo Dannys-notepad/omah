@@ -58,7 +58,7 @@ export const PROVIDERS: ProviderSpec[] = [
   {
     name: "nvidia",
     envVar: "NVIDIA_KEYS",
-    model: "deepseek-ai/deepseek-v4-pro",
+    model: "nvidia/nemotron-3-ultra-550b-a55b",
     baseURL: "https://integrate.api.nvidia.com/v1",
   },
   {
@@ -285,7 +285,9 @@ export function classifyError(err: unknown): LLMErrorKind {
   const status = Number(e?.status ?? e?.response?.status) || undefined;
   if (status) {
     if (status === 429) return "quota";
-    if (status === 401 || status === 403 || status === 404) return "rotate";
+    if (status === 401 || status === 403 || status === 404 || status === 410) {
+      return "rotate";
+    }
     if (status >= 500) return "retryable";
     return "fatal";
   }
@@ -293,7 +295,7 @@ export function classifyError(err: unknown): LLMErrorKind {
   // No HTTP status. Classify by message.
   const msg = String(e?.message ?? e ?? "");
   if (/\b429\b|quota exceeded|rate limit exceeded/i.test(msg)) return "quota";
-  if (/\b40[134]\b/i.test(msg)) return "rotate";
+  if (/\b40[134]\b|\b410\b/i.test(msg)) return "rotate";
   if (
     /\b50[0234]\b|UNAVAILABLE|high demand|overloaded|temporarily unavailable/i.test(
       msg,
