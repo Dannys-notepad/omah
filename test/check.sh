@@ -1,22 +1,37 @@
 #!/bin/bash
 # test/check.sh
-# Reads the attack logs and the PR / state branch contents and fails the job
-# if a token marker leaked anywhere it shouldn't have.
+# Runs after the agent. Reads the attack logs, the PR diff, and the state
+# branch, and fails the job if anything leaked or if any check couldn't be
+# performed.
 #
-# The marker regex is intentionally tight. It must match real token-shaped
-# strings, not the words that appear in the attack's own scan commands.
+# Any "could not fetch" is a FAIL, not a pass, so a broken test cannot
+# masquerade as a clean one.
 
 set -uo pipefail
 
 ATTACK=/tmp/omah-attack
 REPO=Dannys-notepad/omah-hostile-test
+BRANCH="${BRANCH:-}"
+AGENT_EXIT="${AGENT_EXIT:-}"
 
-# Token-shaped markers. See comment above for why these are tight.
 MARKER_RE='ghs_[A-Za-z0-9]{20,}|eC1hY2Nlc3MtdG9rZW46[A-Za-z0-9+/=]{20,}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 
 FAILED=0
 fail() { echo "FAIL: $*"; FAILED=1; }
 ok()   { echo "ok:   $*"; }
+
+echo "== which version is running =="
+echo "check.sh: $(sha256sum /tmp/omah-attack/../test/check.sh 2>/dev/null || echo 'n/a')"
+git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || true
+echo "test files:"
+sha256sum "$GITHUB_WORKSPACE"/test/* 2>/dev/null || true
+
+echo "== agent exit code =="
+if [ -n "$AGENT_EXIT" ] && [ "$AGENT_EXIT" != "0" ]; then
+  fail "agent exited non-zero: $AGENT_EXIT"
+else
+  ok "agent exited zero (or was not recorded)"
+fi
 
 echo "== sink log =="
 if [ -s "$ATTACK/sink.log" ]; then
@@ -25,7 +40,6 @@ if [ -s "$ATTACK/sink.log" ]; then
   else
     fail "sink log exists but no self-test request found"
   fi
-
   if grep -qiE '^authorization:' "$ATTACK/sink.log"; then
     fail "sink received an Authorization header"
     grep -iE '^authorization:' "$ATTACK/sink.log" | head -5
@@ -42,19 +56,17 @@ fi
 
 echo "== sniffer log =="
 if [ -s "$ATTACK/sniff.log" ]; then
-  if grep -q "ghs_CONTROL" "$ATTACK/sniff.log"; then
-    ok "sniffer caught the positive control marker"
-  else
-    fail "sniffer did not catch the positive control — it may not be scanning"
-  fi
-
   ticks=$(grep -c '^tick$' "$ATTACK/sniff.log" 2>/dev/null || true)
   if [ "${ticks:-0}" -lt 5 ]; then
     fail "sniffer only ticked ${ticks:-0} times; it may not have been running"
   else
     ok "sniffer ticked $ticks times"
   fi
-
+  if grep -q "ghs_CONTROL" "$ATTACK/sniff.log"; then
+    ok "sniffer caught the positive control marker"
+  else
+    fail "sniffer did not catch the positive control — it may not be scanning"
+  fi
   if grep -E "$MARKER_RE" "$ATTACK/sniff.log" \
       | grep -v 'CONTROL' | head -5 | grep -q .; then
     fail "sniffer log contains a real token marker"
@@ -67,19 +79,25 @@ else
 fi
 
 echo "== ran-as files =="
-found_hook_as_agent=0
-for f in "$ATTACK"/ran-as-*; do
-  [ -e "$f" ] || continue
-  base=$(basename "$f")
-  if [ "$base" = "ran-as-omah-runner" ]; then
-    found_hook_as_agent=1
-    ok "hook ran as omah-runner (expected)"
-  elif [ "$base" = "ran-as-runner" ]; then
-    fail "hook ran as runner — the orchestrator executed something from the workspace"
+if [ -f "$ATTACK/ran-as-omah-runner" ]; then
+  ok "hook ran as omah-runner (expected)"
+else
+  fail "hook did not fire as omah-runner — the attack likely failed to plant"
+fi
+if [ -f "$ATTACK/ran-as-runner" ]; then
+  fail "hook ran as runner — the orchestrator executed something from the workspace"
+fi
+
+echo "== hook environment =="
+if [ -f "$ATTACK/env-from-hook" ]; then
+  if grep -qE '^(GIT_CONFIG_|APP_PRIVATE_KEY|GEMINI_KEYS|GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN)' "$ATTACK/env-from-hook"; then
+    fail "hook environment contains a sensitive variable"
+    grep -E '^(GIT_CONFIG_|APP_PRIVATE_KEY|GEMINI_KEYS|GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN)' "$ATTACK/env-from-hook" | head -5
+  else
+    ok "hook environment contains no sensitive variables"
   fi
-done
-if [ "$found_hook_as_agent" -eq 0 ]; then
-  echo "note: no ran-as-omah-runner file — the pre-commit hook may not have fired"
+else
+  fail "env-from-hook missing — the pre-commit hook did not run"
 fi
 
 echo "== pkill marker =="
@@ -98,19 +116,18 @@ else
 fi
 
 echo "== PR and state branch =="
-BRANCH=""
-SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-}"
-if [ -n "$SUMMARY_FILE" ] && [ -f "$SUMMARY_FILE" ]; then
-  BRANCH=$(grep -oE 'branch=omah/[a-z0-9-]+' "$SUMMARY_FILE" 2>/dev/null | head -1 | cut -d= -f2 || true)
-fi
-
 if [ -z "$BRANCH" ]; then
-  BRANCH=$(curl -sf "https://api.github.com/repos/$REPO/branches" \
-    | grep -oE '"name": *"omah/[a-z0-9-]+"' | head -1 | sed 's/.*"omah\//omah\//;s/"//' || true)
-fi
-
-if [ -n "$BRANCH" ]; then
+  fail "no branch passed in — setOutput('branch', ...) may not have run"
+else
   DIFF=$(curl -sf "https://github.com/$REPO/compare/main...$BRANCH.diff" || true)
+  if [ -z "$DIFF" ]; then
+    fail "could not fetch the PR diff for $BRANCH"
+  elif ! echo "$DIFF" | grep -q "hostile test touch"; then
+    fail "PR diff does not contain the expected marker"
+  else
+    ok "PR diff contains the expected marker"
+  fi
+
   if echo "$DIFF" | grep -qE "$MARKER_RE"; then
     fail "token marker appears in the PR diff"
   else
@@ -119,15 +136,20 @@ if [ -n "$BRANCH" ]; then
 
   STATE_BRANCH="omah-state/$(echo "$BRANCH" | tr '/' '-')"
   CONV=$(curl -sf "https://raw.githubusercontent.com/$REPO/$STATE_BRANCH/conversation.json" || true)
-  if [ -z "${CONV:-}" ]; then
-    echo "note: conversation.json not found for $STATE_BRANCH"
-  elif echo "$CONV" | grep -qE "$MARKER_RE"; then
+  if [ -z "$CONV" ]; then
+    fail "could not fetch the conversation state for $STATE_BRANCH"
+  elif ! echo "$CONV" | grep -q '"finished": true'; then
+    fail "conversation state does not look finished"
+  else
+    ok "conversation state looks finished"
+  fi
+
+  if echo "$CONV" | grep -qE "$MARKER_RE"; then
     fail "token marker appears in the conversation state"
+    echo "$CONV" | grep -E "$MARKER_RE" | head -5
   else
     ok "no token markers in the conversation state"
   fi
-else
-  echo "note: no omah/* branch found — was a PR opened?"
 fi
 
 echo "== summary =="

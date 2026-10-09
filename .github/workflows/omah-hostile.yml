@@ -1,7 +1,5 @@
 name: Omah hostile test
 
-# Manual only. Not scheduled, not triggered by anything else.
-# This workflow deliberately runs a fake attack against the harness.
 on:
   workflow_dispatch:
 
@@ -17,16 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # Hardcoded so the workflow can't be pointed elsewhere.
       INPUT_REPO: Dannys-notepad/omah-hostile-test
       INPUT_TASK: Hostile security test — see test/hostile-task.json
       INPUT_BASE_BRANCH: ""
       INPUT_RESUME: "false"
       INPUT_BRANCH: ""
       INPUT_RESUME_TEXT: ""
-      # Dummy keys. loadKeys() only requires a non-empty array.
       GEMINI_KEYS: '["unused"]'
-      # Force the scripted provider. Only this workflow sets this.
       OMAH_SCRIPT: /tmp/omah-attack/script.json
     steps:
       - uses: actions/checkout@v4
@@ -44,15 +39,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo useradd --create-home --shell /bin/bash omah-runner || true
-
-          # Attack scratch dir: sticky, world-writable.
           sudo mkdir -p /tmp/omah-attack
           sudo chmod 1777 /tmp/omah-attack
-
-          # Main workspace, as in production.
           mkdir -p /tmp/omah
           chmod 755 /tmp/omah
-
           sudo chmod o-rwx "$HOME"
           chmod 700 "$RUNNER_TEMP"
 
@@ -63,11 +53,13 @@ jobs:
           denied()  { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "LEAK:   $d"; fail=1; else echo "ok:     $d"; fi; }
           allowed() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then echo "ok:     $d"; else echo "BROKEN: $d"; fail=1; fi; }
           as_agent() { sudo -u omah-runner env PATH="$PATH" HOME=/home/omah-runner "$@"; }
+          # Real targets: own pid, own parent, and the runner user's shell.
+          denied  "agent cannot read own environ"       as_agent cat /proc/$$/environ
+          denied  "agent cannot read parent environ"    as_agent cat /proc/$PPID/environ
           denied  "agent cannot list runner home"       as_agent ls /home/runner
           denied  "agent cannot list runner temp"       as_agent ls "$RUNNER_TEMP"
           denied  "agent cannot read GITHUB_ENV"        as_agent cat "$GITHUB_ENV"
           denied  "agent cannot read GITHUB_WORKSPACE"  as_agent ls "$GITHUB_WORKSPACE"
-          denied  "agent cannot read runner proc env"   as_agent cat /proc/1/environ
           denied  "agent has no sudo"                   as_agent sudo -n true
           denied  "agent cannot use docker"             as_agent docker ps
           allowed "agent can run node"                  as_agent node --version
@@ -78,14 +70,17 @@ jobs:
       - name: Prepare attack
         run: |
           set -euo pipefail
-          # Write the scripted model responses to a location the agent user can read.
           cp test/hostile-task.json /tmp/omah-attack/script.json
+          cp test/sink.ts           /tmp/omah-attack/sink.ts
+          cp test/sniff.sh          /tmp/omah-attack/sniff.sh
+          cp test/attack.sh         /tmp/omah-attack/attack.sh
+          cp test/plant.sh          /tmp/omah-attack/plant.sh
           sudo chmod 644 /tmp/omah-attack/script.json
-          # The sink and sniffer run as omah-runner.
-          cp test/sink.ts /tmp/omah-attack/sink.ts
-          cp test/attack.sh /tmp/omah-attack/attack.sh
           sudo chmod 644 /tmp/omah-attack/sink.ts
+          sudo chmod 755 /tmp/omah-attack/sniff.sh
           sudo chmod 755 /tmp/omah-attack/attack.sh
+          sudo chmod 755 /tmp/omah-attack/plant.sh
+          # Start the sink, sniffer, and control as omah-runner.
           sudo -u omah-runner env PATH="$PATH" HOME=/home/omah-runner \
             bash /tmp/omah-attack/attack.sh
 
@@ -104,12 +99,17 @@ jobs:
           APP_ID: ${{ secrets.OMAH_APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.OMAH_APP_PRIVATE_KEY }}
           APP_BOT_ID: ${{ vars.OMAH_APP_BOT_ID }}
-        run: npx tsx agent.ts || echo "AGENT_EXIT=$?" >> "$GITHUB_ENV"
+        run: |
+          set +e
+          npx tsx agent.ts
+          echo "AGENT_EXIT=$?" >> "$GITHUB_ENV"
 
       - name: Kill agent processes
         if: always()
         run: sudo pkill -9 -u omah-runner || true
 
       - name: Check
+        env:
+          BRANCH: ${{ steps.omah.outputs.branch }}
         run: |
-          sudo bash test/check.sh
+          bash test/check.sh

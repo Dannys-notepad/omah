@@ -265,6 +265,7 @@ async function main(): Promise<void> {
 
   await log(`task=${taskId} repo=${targetRepo} base=${baseBranch}`);
   await log(`branch=${branchName} resume=${resume}`);
+  setOutput("branch", branchName);setOutput("branch", branchName);
 
   const conversation: Conversation = resume
     ? await loadConversation(targetRepo, branchName, appToken)
