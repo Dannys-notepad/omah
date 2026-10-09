@@ -28,6 +28,17 @@ on:
         description: "Follow-up instruction (resume only)"
         required: false
         type: string
+      provider:
+        description: "Preferred provider (tried first, then default order)"
+        required: false
+        type: choice
+        default: default
+        options:
+          - default
+          - gemini
+          - nvidia
+          - mistral
+          - opencode
 
 permissions:
   contents: read
@@ -150,6 +161,7 @@ jobs:
           INPUT_RESUME: ${{ inputs.resume }}
           INPUT_BRANCH: ${{ inputs.branch }}
           INPUT_RESUME_TEXT: ${{ inputs.resume_text }}
+          INPUT_PROVIDER: ${{ inputs.provider }}
           GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
           NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
           MISTRAL_KEYS: ${{ secrets.MISTRAL_KEYS }}

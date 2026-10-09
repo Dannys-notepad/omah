@@ -2021,6 +2021,20 @@ function loadKeys(): KeySpec[] {
   for (const k of specs) {
     console.log(`::add-mask::${k.key}`);
   }
+
+  // Optional preference: try the named provider first, then everything else.
+  const preferred = (process.env.INPUT_PROVIDER || "default").trim().toLowerCase();
+  if (preferred && preferred !== "default") {
+    const first = specs.filter((k) => k.provider === preferred);
+    const rest = specs.filter((k) => k.provider !== preferred);
+    if (first.length === 0) {
+      console.warn(
+        `[omah] preference "${preferred}" matched no keys; using default order`,
+      );
+      return specs;
+    }
+    return [...first, ...rest];
+  }
   return specs;
 }
 
