@@ -1742,12 +1742,14 @@ async function callModel(
       lastErr = err;
 
       if (isQuotaError(err)) {
-  const s = keyStats.get(keyIndex);
-  if (!s || s.rate429 === 0) {
-    await log(`key ${keyIndex + 1} 429 (full message): ${String(err?.message ?? err)}`);
-  }
-  recordKeyRateLimit(keyIndex, String(err?.message ?? err));
-} else if (!isRetryableError(err)) {
+        const s = keyStats.get(keyIndex);
+        if (!s || s.rate429 === 0) {
+          await log(
+            `key ${keyIndex + 1} 429 (full message): ${String(err?.message ?? err)}`,
+          );
+        }
+        recordKeyRateLimit(keyIndex, String(err?.message ?? err));
+      } else if (!isRetryableError(err)) {
         recordKeyError(keyIndex, String(err?.message ?? err));
       }
 
@@ -1755,14 +1757,12 @@ async function callModel(
 
       // Backoff: 2s, 4s, 8s, 16s, 32s. Total ~62s before giving up.
       const delay = 2000 * Math.pow(2, attempt);
+      const statusCode =
+        (err as any)?.status ?? (err as any)?.code ?? "?";
+      const snippet = String((err as any)?.message ?? err).slice(0, 120);
       await log(
-        `retry ${attempt + 1}/${MAX_LLM_RETRIES} after ${delay}ms: ${String(
-          (err as any)?.message ?? err,
-        ).slice(0, 120)}`,
+        `attempt ${attempt + 1}/${MAX_LLM_RETRIES} failed (status=${statusCode}): ${snippet}`,
       );
-      await log(
-  `attempt ${attempt + 1}/${MAX_LLM_RETRIES} failed (${code}): ${msg.slice(0, 120)}`,
-);
       await sleep(delay);
     }
   }
