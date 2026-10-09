@@ -1,15 +1,3 @@
-# Put this file at .github/workflows/omah.yml in the Omah repo.
-# The repo root must also contain: agent.ts, system.md, .omahignore.default,
-# package.json, package-lock.json, and tsconfig.json.
-#
-# Secrets (Settings -> Secrets and variables -> Actions):
-#   GEMINI_KEYS            JSON array of Gemini keys, e.g. ["key1","key2"]
-#   OMAH_APP_ID            GitHub App ID
-#   OMAH_APP_PRIVATE_KEY   GitHub App private key (PEM)
-# Variables (optional):
-#   OMAH_APP_BOT_ID        bot user id (skips one API lookup)
-#   OMAH_ALLOWED_REPOS     comma-separated "owner/name" allowlist
-
 name: Omah
 
 on:
@@ -41,11 +29,9 @@ on:
         required: false
         type: string
 
-# The default GITHUB_TOKEN only needs to check out this repo.
 permissions:
   contents: read
 
-# One run at a time (serial by design).
 concurrency:
   group: omah
   cancel-in-progress: false
@@ -106,13 +92,9 @@ jobs:
           set -euo pipefail
           sudo useradd --create-home --shell /bin/bash omah-runner
 
-          # /tmp/omah stays owned by the runner user. agent.ts chowns only
-          # /tmp/omah/workspace to the agent user.
           mkdir -p /tmp/omah
           chmod 755 /tmp/omah
 
-          # Keep the agent out of everything the runner user owns.
-          # The agent gets its own HOME and npm cache via agent.ts.
           sudo chmod o-rwx "$HOME"
           chmod 700 "$RUNNER_TEMP"
 
@@ -138,8 +120,6 @@ jobs:
             fi
           }
 
-          # Can't unquoted-expand $AGENT across multiple words, so use a
-          # wrapper function that runs a single command as the agent user.
           as_agent() {
             sudo -u omah-runner env PATH="$PATH" HOME=/home/omah-runner "$@"
           }
@@ -148,7 +128,8 @@ jobs:
           denied  "agent cannot list runner temp"        as_agent ls "$RUNNER_TEMP"
           denied  "agent cannot read GITHUB_ENV"         as_agent cat "$GITHUB_ENV"
           denied  "agent cannot read GITHUB_WORKSPACE"   as_agent ls "$GITHUB_WORKSPACE"
-          denied  "agent cannot read runner proc env"    as_agent cat /proc/1/environ
+          denied  "agent cannot read own proc env"       as_agent cat /proc/$$/environ
+          denied  "agent cannot read parent proc env"    as_agent cat /proc/$PPID/environ
           denied  "agent has no sudo"                    as_agent sudo -n true
           denied  "agent cannot use docker"              as_agent docker ps
 
@@ -170,6 +151,9 @@ jobs:
           INPUT_BRANCH: ${{ inputs.branch }}
           INPUT_RESUME_TEXT: ${{ inputs.resume_text }}
           GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          MISTRAL_KEYS: ${{ secrets.MISTRAL_KEYS }}
+          OPENCODE_KEYS: ${{ secrets.OPENCODE_KEYS }}
           APP_ID: ${{ secrets.OMAH_APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.OMAH_APP_PRIVATE_KEY }}
           APP_BOT_ID: ${{ vars.OMAH_APP_BOT_ID }}

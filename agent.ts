@@ -8,7 +8,14 @@ import { createSign } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import ignore from "ignore";
-import { GoogleGenAI } from "@google/genai";
+import {
+  loadAllKeys,
+  makeProvider,
+  classifyError,
+  type KeySpec,
+  type LLMProvider,
+  type LLMMessage,
+} from "./llm.js";
 
 const exec = promisify(execFile);
 
@@ -324,6 +331,10 @@ async function main(): Promise<void> {
 
   const systemPrompt = await fs.readFile(SYSTEM_PROMPT_PATH, "utf8");
   const keys = loadKeys();
+  await log(
+    `loaded ${keys.length} keys: ` +
+      keys.map((k, i) => `${i + 1}=${k.provider}`).join(", "),
+  );
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
 
   const result = await runLoop({
@@ -380,6 +391,7 @@ async function main(): Promise<void> {
       setupMs,
       pushMs,
       keysTotal: keys.length,
+      keySpecs: keys,
     }),
   );
 
@@ -395,7 +407,7 @@ interface RunLoopArgs {
   task: string;
   resumeText: string;
   conversation: Conversation;
-  keys: string[];
+  keys: KeySpec[];
   targetRepo: string;
   branchName: string;
   appToken: string;
@@ -476,13 +488,14 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       };
     }
 
-    const model = makeModel(args.keys[keyIndex]);
+    const keySpec = args.keys[keyIndex];
+    const provider: LLMProvider = makeProvider(keySpec);
 
     let responseText: string;
     const stepForLog = args.conversation.steps.length + 1;
     try {
       const result = await callModel(
-        model,
+        provider,
         args.systemPrompt,
         history,
         writeState === null,
@@ -498,39 +511,64 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         tool: "(pending)",
       });
       await log(
-        `[step ${stepForLog}] llm: in=${result.usage.input} out=${result.usage.output}` +
+        `[step ${stepForLog}] llm: provider=${keySpec.provider} ` +
+          `in=${result.usage.input} out=${result.usage.output}` +
           (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
           ` ms=${result.usage.ms} key=${keyIndex + 1}`,
       );
     } catch (err) {
-      const quotaHit = isQuotaError(err);
-      if (quotaHit) {
-        await sleep(2000);
-        if (keyIndex < args.keys.length - 1) {
+      const kind = classifyError(err);
+      if (kind !== "fatal") {
+        const waitMs = kind === "retryable" ? 2000 : 0;
+        if (waitMs > 0) await sleep(waitMs);
+
+        const badProvider = args.keys[keyIndex].provider;
+        const status = (err as any)?.status;
+        const providerWide = kind === "retryable" || status === 404;
+
+        if (providerWide) {
+          while (
+            keyIndex < args.keys.length &&
+            args.keys[keyIndex].provider === badProvider
+          ) {
+            keyIndex += 1;
+          }
+        } else {
           keyIndex += 1;
-          await log(`rotating to key ${keyIndex + 1}/${args.keys.length}`);
+        }
+
+        if (keyIndex < args.keys.length) {
+          await log(
+            `rotating to key ${keyIndex + 1}/${args.keys.length} ` +
+              `(${args.keys[keyIndex].provider}) [${kind}${
+                providerWide ? ", skipped " + badProvider : ""
+              }]`,
+          );
           continue;
         }
         return {
-          summary: "All Gemini keys are exhausted.",
+          summary: "All LLM keys are exhausted.",
           status: "blocked",
         };
       }
 
-      // Non-quota error that survived retries. Return blocked instead of
-// crashing the whole run so we produce a diagnosable artifact.
-const errAny = err as any;
-const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(0, 300);
-const statusCode = errAny?.status ?? errAny?.code ?? errAny?.response?.status;
-const is503 = statusCode === 503 || /503|UNAVAILABLE|high demand/i.test(msg);
-const label = is503
-  ? "LLM unavailable (503)"
-  : `LLM call failed (status=${statusCode ?? "unknown"})`;
-await log(`blocking: ${label}: ${msg}`);
-return {
-  summary: `${label}: ${msg}`,
-  status: "blocked",
-};
+      // Fatal: report and block.
+      const errAny = err as any;
+      const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(
+        0,
+        300,
+      );
+      const statusCode =
+        errAny?.status ?? errAny?.code ?? errAny?.response?.status;
+      const is503 = statusCode === 503 || /\b503\b|UNAVAILABLE/i.test(msg);
+      const label = is503
+        ? "LLM unavailable (503)"
+        : `LLM call failed (status=${statusCode ?? "unknown"})`;
+      await log(`blocking: ${label}: ${msg}`);
+      return {
+        summary: `${label}: ${msg}`,
+        status: "blocked",
+      };
     }
 
     if (writeState) {
@@ -1654,12 +1692,8 @@ async function loadConversation(
 }
 
 // ---------------------------------------------------------------
-// LLM
+// LLM (delegated to llm.ts)
 // ---------------------------------------------------------------
-
-function makeModel(key: string) {
-  return new GoogleGenAI({ apiKey: key });
-}
 
 let scriptedResponses: string[] | null = null;
 let scriptedIndex = 0;
@@ -1675,7 +1709,7 @@ function loadScriptedResponses(): string[] {
 }
 
 async function callModel(
-  ai: ReturnType<typeof makeModel>,
+  provider: LLMProvider,
   systemPrompt: string,
   history: Message[],
   jsonMode: boolean,
@@ -1711,37 +1745,25 @@ async function callModel(
     };
   }
 
+  const llmHistory: LLMMessage[] = history.map((m) => ({
+    role: m.role === "model" ? "assistant" : "user",
+    content: m.parts[0].text,
+  }));
+
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {
-      const started = Date.now();
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: history,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.2,
-          ...(jsonMode ? { responseMimeType: "application/json" } : {}),
-        },
-      });
-
-      const elapsed = Date.now() - started;
-      recordKeyCall(keyIndex);
-
-      const um: any = (response as any).usageMetadata ?? {};
-      const usage: UsageInfo = {
-        input: Number(um.promptTokenCount ?? 0),
-        output: Number(um.candidatesTokenCount ?? 0),
-        thoughts: Number(um.thoughtsTokenCount ?? 0),
-        ms: elapsed,
+      const result = await provider.complete(
+        { systemPrompt, history: llmHistory, jsonMode },
         keyIndex,
-      };
-
-      return { text: response.text ?? "", usage };
+      );
+      recordKeyCall(keyIndex);
+      return result;
     } catch (err: any) {
       lastErr = err;
+      const kind = classifyError(err);
 
-      if (isQuotaError(err)) {
+      if (kind === "quota") {
         const s = keyStats.get(keyIndex);
         if (!s || s.rate429 === 0) {
           await log(
@@ -1749,16 +1771,14 @@ async function callModel(
           );
         }
         recordKeyRateLimit(keyIndex, String(err?.message ?? err));
-      } else if (!isRetryableError(err)) {
+        throw err;
+      } else if (kind === "fatal" || kind === "rotate") {
         recordKeyError(keyIndex, String(err?.message ?? err));
+        throw err;
       }
 
-      if (!isRetryableError(err)) throw err;
-
-      // Backoff: 2s, 4s, 8s, 16s, 32s. Total ~62s before giving up.
       const delay = 2000 * Math.pow(2, attempt);
-      const statusCode =
-        (err as any)?.status ?? (err as any)?.code ?? "?";
+      const statusCode = (err as any)?.status ?? "?";
       const snippet = String((err as any)?.message ?? err).slice(0, 120);
       await log(
         `attempt ${attempt + 1}/${MAX_LLM_RETRIES} failed (status=${statusCode}): ${snippet}`,
@@ -1767,17 +1787,6 @@ async function callModel(
     }
   }
   throw lastErr;
-}
-
-function isRetryableError(err: any): boolean {
-  const code = err?.status ?? err?.code ?? err?.response?.status;
-  return code === 500 || code === 502 || code === 503 || code === 504;
-}
-
-function isQuotaError(err: any): boolean {
-  const code = err?.status ?? err?.code ?? err?.response?.status;
-  const msg = String(err?.message ?? "");
-  return code === 429 || /quota|rate limit/i.test(msg);
 }
 
 // ---------------------------------------------------------------
@@ -1790,6 +1799,7 @@ function buildUsageSummary(args: {
   setupMs: number;
   pushMs: number;
   keysTotal: number;
+  keySpecs: KeySpec[];
 }): string {
   const steps = usageLog.length;
   const sumIn = usageLog.reduce((a, u) => a + u.input, 0);
@@ -1817,14 +1827,18 @@ function buildUsageSummary(args: {
   lines.push("");
   lines.push("### Per key");
   lines.push("");
-  lines.push("| key | calls | 429 | errors | last error |");
-  lines.push("|---|---|---|---|---|");
+  lines.push("| key | provider | calls | 429 | errors | last error |");
+  lines.push("|---|---|---|---|---|---|");
   for (let i = 0; i < args.keysTotal; i++) {
     const s = keyStats.get(i) ?? { calls: 0, rate429: 0, errors: 0 };
+    const spec = args.keySpecs[i];
+    const provider = spec?.provider ?? "?";
     const err = s.lastError
       ? s.lastError.replace(/\|/g, "\\|").slice(0, 100)
       : "";
-    lines.push(`| ${i + 1} | ${s.calls} | ${s.rate429} | ${s.errors} | ${err} |`);
+    lines.push(
+      `| ${i + 1} | ${provider} | ${s.calls} | ${s.rate429} | ${s.errors} | ${err} |`,
+    );
   }
 
   lines.push("");
@@ -2000,13 +2014,14 @@ function requireEnv(name: string): string {
   return v;
 }
 
-function loadKeys(): string[] {
-  const raw = requireEnv("GEMINI_KEYS");
-  const parsed = JSON.parse(raw);
-  if (!Array.isArray(parsed) || parsed.length === 0) {
-    throw new Error("GEMINI_KEYS must be a non-empty JSON array");
+function loadKeys(): KeySpec[] {
+  const specs = loadAllKeys(async (msg) => {
+    await log(msg);
+  });
+  for (const k of specs) {
+    console.log(`::add-mask::${k.key}`);
   }
-  return parsed.map(String);
+  return specs;
 }
 
 function setOutput(key: string, value: string): void {
