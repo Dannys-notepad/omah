@@ -1709,8 +1709,8 @@ async function callModel(
 
   let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
-    const started = Date.now();
     try {
+      const started = Date.now();
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
         contents: history,
@@ -1738,8 +1738,12 @@ async function callModel(
       lastErr = err;
 
       if (isQuotaError(err)) {
-        recordKeyRateLimit(keyIndex, String(err?.message ?? err));
-      } else if (!isRetryableError(err)) {
+  const s = keyStats.get(keyIndex);
+  if (!s || s.rate429 === 0) {
+    await log(`key ${keyIndex + 1} 429 (full message): ${String(err?.message ?? err)}`);
+  }
+  recordKeyRateLimit(keyIndex, String(err?.message ?? err));
+} else if (!isRetryableError(err)) {
         recordKeyError(keyIndex, String(err?.message ?? err));
       }
 
@@ -1752,6 +1756,9 @@ async function callModel(
           (err as any)?.message ?? err,
         ).slice(0, 120)}`,
       );
+      await log(
+  `attempt ${attempt + 1}/${MAX_LLM_RETRIES} failed (${code}): ${msg.slice(0, 120)}`,
+);
       await sleep(delay);
     }
   }

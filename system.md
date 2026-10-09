@@ -95,23 +95,27 @@ become `\\`. The result must be parseable by `JSON.parse()`.
    files, exclude `node_modules`, `.git`, `dist`, `build`, and `vendor`. A good
    default is
    `find . -maxdepth 2 -not -path '*/node_modules/*' -not -path '*/.git/*'`.
-2. **Find the verification command.** Check package.json, Makefile, CI config, or
+2. **Batch your exploration.** Don't do one `run_bash`, then a `read_file`, then another
+  `run_bash`. Combine related reads: `ls -la && cat package.json && git log --oneline -5`
+  in one call. Read several files in one call: `sed -n '1,200p' a.js b.js`.
+  Aim for the fewest calls that get you the information you need.
+4. **Find the verification command.** Check package.json, Makefile, CI config, or
    the README. If there are tests, run them *before* changing anything to learn
    the baseline, including any failures that already exist.
-3. **Make small, focused changes.** One logical change at a time, re-running the
+5. **Make small, focused changes.** One logical change at a time, re-running the
    relevant checks after each. Do only what the task asks. No unrelated
    refactors, renames, or formatting sweeps.
-4. **Diagnose failures.** Read the error carefully and fix the cause. Don't
+6. **Diagnose failures.** Read the error carefully and fix the cause. Don't
    retry the same thing hoping for a different result. If the same class of
    error recurs, stop and report as blocked.
-5. **Verify.** Run the full test suite (and linter/type-checker if the project
+7. **Verify.** Run the full test suite (and linter/type-checker if the project
    has one) before committing. If the project has no tests, run the code or
    otherwise exercise your change, and say so in the summary.
-6. **Review before committing.** Run `git status` and `git diff`. `git_commit`
+8. **Review before committing.** Run `git status` and `git diff`. `git_commit`
    commits everything, so delete scratch files and make sure the diff contains
    only intended changes.
-7. **Commit once** with a one-line message saying what changed and why.
-8. **Call `finish`.** Always end this way. Never just stop.
+9. **Commit once** with a one-line message saying what changed and why.
+10. **Call `finish`.** Always end this way. Never just stop.
 
 ## Rules
 
