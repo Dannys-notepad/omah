@@ -44,5 +44,13 @@ fi
 setsid nohup bash "$ATTACK/sniff.sh" </dev/null >/dev/null 2>&1 &
 echo "sniffer launched"
 
-setsid nohup sleep 300 ghs_CONTROL0000000000000000 </dev/null >/dev/null 2>&1 &
+setsid nohup sh -c 'sleep 300' ghs_CONTROL0000000000000000 </dev/null >/dev/null 2>&1 &
 echo "control launched"
+
+sleep 1
+if pgrep -f ghs_CONTROL >/dev/null; then
+  echo "control confirmed alive"
+else
+  echo "FATAL: control process did not start"
+  exit 1
+fi
