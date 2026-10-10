@@ -2088,17 +2088,25 @@ function matchBrace(s: string, start: number): number {
 function tryParse(s: string): ParsedOutput | null {
   try {
     const obj = JSON.parse(s);
-    if (
-      typeof obj?.tool !== "string" ||
-      typeof obj?.args !== "object" ||
-      obj.args === null
-    ) {
-      return null;
+    if (typeof obj?.tool !== "string") return null;
+
+    // Standard: { reasoning, tool, args }
+    if (typeof obj?.args === "object" && obj.args !== null) {
+      return {
+        reasoning: String(obj.reasoning ?? ""),
+        tool: obj.tool as ToolName,
+        args: obj.args as Record<string, unknown>,
+      };
     }
+
+    // Poolside-flat: { reasoning, tool, command } or similar.
+    // Everything except reasoning and tool becomes args.
+    const { reasoning, tool, ...rest } = obj;
+    if (Object.keys(rest).length === 0) return null;
     return {
-      reasoning: String(obj.reasoning ?? ""),
-      tool: obj.tool as ToolName,
-      args: obj.args as Record<string, unknown>,
+      reasoning: String(reasoning ?? ""),
+      tool: tool as ToolName,
+      args: rest,
     };
   } catch {
     return null;
