@@ -36,10 +36,11 @@ on:
         options:
           - default
           - gemini
-          - groq
           - requesty
+          - groq
           - mistral
           - nvidia
+          - poolside
 
 permissions:
   contents: read
@@ -168,6 +169,7 @@ jobs:
           GROQ_KEYS: ${{ secrets.GROQ_KEYS }}
           GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
           REQUESTY_KEYS: ${{ secrets.REQUESTY_KEYS }}
+          POOLSIDE_KEYS: ${{ secrets.POOLSIDE_KEYS }}
           MISTRAL_KEYS: ${{ secrets.MISTRAL_KEYS }}
           NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
           APP_ID: ${{ secrets.OMAH_APP_ID }}

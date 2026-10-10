@@ -68,6 +68,12 @@ export const PROVIDERS: ProviderSpec[] = [
   baseURL: "https://router.requesty.ai/v1",
 },
   {
+  name: "poolside",
+  envVar: "POOLSIDE_KEYS",
+  model: "poolside/laguna-s-2.1",
+  baseURL: "https://inference.poolside.ai/v1",
+},
+  {
     name: "mistral",
     envVar: "MISTRAL_KEYS",
     model: "mistral-medium-3.5",
