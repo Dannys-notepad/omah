@@ -50,10 +50,10 @@ export const PROVIDERS: ProviderSpec[] = [
     baseURL: null,
   },
   {
-    name: "groq",
-    envVar: "GROQ_KEYS",
-    model: "openai/gpt-oss-120b",
-    baseURL: "https://api.groq.com/openai/v1",
+    name: "poolside",
+    envVar: "POOLSIDE_KEYS",
+    model: "poolside/laguna-s-2.1",
+    baseURL: "https://inference.poolside.ai/v1",
   },
   {
     name: "requesty",
@@ -61,18 +61,12 @@ export const PROVIDERS: ProviderSpec[] = [
     model: "mistral/leanstral-1-5",
     baseURL: "https://router.requesty.ai/v1",
   },
-  /*{
-  name: "requesty",
-  envVar: "REQUESTY_KEYS",
-  model: "google/gemma-4-31b-it",
-  baseURL: "https://router.requesty.ai/v1",
-},*/
   {
-  name: "poolside",
-  envVar: "POOLSIDE_KEYS",
-  model: "poolside/laguna-s-2.1",
-  baseURL: "https://inference.poolside.ai/v1",
-},
+    name: "groq",
+    envVar: "GROQ_KEYS",
+    model: "openai/gpt-oss-120b",
+    baseURL: "https://api.groq.com/openai/v1",
+  },
   {
     name: "mistral",
     envVar: "MISTRAL_KEYS",
