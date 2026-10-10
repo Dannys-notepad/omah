@@ -185,15 +185,16 @@ export class OpenAICompatibleProvider implements LLMProvider {
       ...req.history.map((m) => ({ role: m.role, content: m.content })),
     ];
 
+    // Note: no response_format. Some OpenAI-compatible endpoints inject
+    // their own JSON-mode instructions into the prompt, which produces
+    // empty or malformed output with reasoning models. The parser in
+    // agent.ts strips code fences and handles plain text.
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
       temperature: 0.2,
       max_tokens: MAX_OUTPUT_TOKENS,
     };
-    if (req.jsonMode) {
-      body.response_format = { type: "json_object" };
-    }
 
     let res: Response;
     try {
@@ -213,13 +214,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
     if (!res.ok) {
       const text = await res.text();
-      if (
-        req.jsonMode &&
-        (res.status === 400 || res.status === 422) &&
-        /response_format|json_object/i.test(text)
-      ) {
-        return this.complete({ ...req, jsonMode: false }, keyIndex);
-      }
       throw makeHttpError(res.status, text, res.headers);
     }
 
@@ -299,25 +293,15 @@ export function classifyError(err: unknown): LLMErrorKind {
   const e = err as any;
   const status = Number(e?.status ?? e?.response?.status) || undefined;
   if (status) {
-  if (status === 429) return "quota";
-  if (status === 413) return "rotate";
-  if (status === 401 || status === 403 || status === 404 || status === 410) {
-    return "rotate";
-  }
-  if (status >= 500) return "retryable";
-  if (status === 400) {
-    const fullMsg = String(e?.message ?? e ?? "");
-    if (
-      /json_validate_failed|INVALID_ARGUMENT|Failed to generate JSON|Failed to validate JSON|response_format/i.test(
-        fullMsg,
-      )
-    ) {
-      return "retryable";
+    if (status === 429) return "quota";
+    if (status === 401 || status === 403 || status === 404 || status === 410) {
+      return "rotate";
     }
+    if (status === 413) return "rotate";
+    if (status === 400 || status === 422) return "rotate";
+    if (status >= 500) return "retryable";
     return "fatal";
   }
-  return "fatal";
-}
 
   const msg = String(e?.message ?? e ?? "");
   if (/\b429\b|quota exceeded|rate limit exceeded/i.test(msg)) return "quota";
