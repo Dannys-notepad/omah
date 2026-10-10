@@ -719,11 +719,14 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         }
         await log(`write error [${outcome.code}]: ${outcome.message}`);
 
-        history.push({ role: "model", parts: [{ text: responseText }] });
         history.push({
-          role: "user",
-          parts: [{ text: `Tool result (error):\n${outcome.message}` }],
-        });
+  role: "model",
+  parts: [{ text: "[attempted JSON tool call instead of raw content]" }],
+});
+history.push({
+  role: "user",
+  parts: [{ text: `Tool result (error):\n${outcome.message}` }],
+});
         args.conversation.steps.push({
           step: args.conversation.steps.length + 1,
           reasoning: pendingWriteReasoning,
