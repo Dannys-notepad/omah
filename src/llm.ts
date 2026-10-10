@@ -70,8 +70,8 @@ export const PROVIDERS: ProviderSpec[] = [
   {
   name: "poolside",
   envVar: "POOLSIDE_KEYS",
-  model: "poolside/laguna-s-2.1",
-  baseURL: "https://inference.poolside.ai/v1",
+  model: "poolside/laguna-s-2.1-free",
+  baseURL: "https://ai-gateway.vercel.sh/v1",
 },
   {
     name: "mistral",
