@@ -3,10 +3,6 @@
 
 import { GoogleGenAI } from "@google/genai";
 
-// ---------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------
-
 export interface LLMMessage {
   role: "user" | "assistant";
   content: string;
@@ -37,10 +33,6 @@ export interface LLMProvider {
 
 export type LLMErrorKind = "quota" | "rotate" | "retryable" | "fatal";
 
-// ---------------------------------------------------------------
-// Provider specs
-// ---------------------------------------------------------------
-
 export interface ProviderSpec {
   name: string;
   envVar: string;
@@ -56,10 +48,16 @@ export const PROVIDERS: ProviderSpec[] = [
     baseURL: null,
   },
   {
-    name: "nvidia",
-    envVar: "NVIDIA_KEYS",
-    model: "nvidia/nemotron-3-ultra-550b-a55b",
-    baseURL: "https://integrate.api.nvidia.com/v1",
+    name: "groq",
+    envVar: "GROQ_KEYS",
+    model: "openai/gpt-oss-120b",
+    baseURL: "https://api.groq.com/openai/v1",
+  },
+  {
+    name: "requesty",
+    envVar: "REQUESTY_KEYS",
+    model: "mistral/leanstral-1-5",
+    baseURL: "https://router.requesty.ai/v1",
   },
   {
     name: "mistral",
@@ -68,16 +66,12 @@ export const PROVIDERS: ProviderSpec[] = [
     baseURL: "https://api.mistral.ai/v1",
   },
   {
-    name: "opencode",
-    envVar: "OPENCODE_KEYS",
-    model: "nemotron-3.5-lightning-free",
-    baseURL: "https://opencode.ai/inference/openai/v1",
+    name: "nvidia",
+    envVar: "NVIDIA_KEYS",
+    model: "nvidia/nemotron-3-ultra-550b-a55b",
+    baseURL: "https://integrate.api.nvidia.com/v1",
   },
 ];
-
-// ---------------------------------------------------------------
-// Key loading
-// ---------------------------------------------------------------
 
 export interface KeySpec {
   provider: string;
@@ -89,27 +83,34 @@ export interface KeySpec {
 export function loadAllKeys(
   log?: (msg: string) => Promise<void>,
 ): KeySpec[] {
+  const disabled = new Set(
+    (process.env.OMAH_DISABLED_PROVIDERS || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+
   const out: KeySpec[] = [];
   for (const spec of PROVIDERS) {
+    if (disabled.has(spec.name)) {
+      if (log) void log(`provider ${spec.name}: disabled`);
+      continue;
+    }
     const raw = process.env[spec.envVar];
     if (!raw) {
-      if (log)
-        void log(`provider ${spec.name}: no ${spec.envVar} set, skipping`);
+      if (log) void log(`provider ${spec.name}: no ${spec.envVar} set, skipping`);
       continue;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      if (log)
-        void log(`provider ${spec.name}: ${spec.envVar} is not valid JSON`);
+      if (log) void log(`provider ${spec.name}: ${spec.envVar} is not valid JSON`);
       continue;
     }
     if (!Array.isArray(parsed) || parsed.length === 0) {
       if (log)
-        void log(
-          `provider ${spec.name}: ${spec.envVar} is not a non-empty array`,
-        );
+        void log(`provider ${spec.name}: ${spec.envVar} is not a non-empty array`);
       continue;
     }
     for (const k of parsed) {
@@ -131,9 +132,8 @@ export function loadAllKeys(
   return out;
 }
 
-// ---------------------------------------------------------------
-// Gemini provider
-// ---------------------------------------------------------------
+const MAX_OUTPUT_TOKENS = 16384;
+const FETCH_TIMEOUT_MS = 120_000;
 
 export class GeminiProvider implements LLMProvider {
   constructor(private key: string, private model: string) {}
@@ -150,6 +150,7 @@ export class GeminiProvider implements LLMProvider {
       config: {
         systemInstruction: req.systemPrompt,
         temperature: 0.2,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
         ...(req.jsonMode ? { responseMimeType: "application/json" } : {}),
       },
     });
@@ -158,7 +159,7 @@ export class GeminiProvider implements LLMProvider {
     const um: any = (response as any).usageMetadata ?? {};
     const rawText = response.text ?? "";
     return {
-      text: stripThinking(rawText),
+      text: stripLeadingThinking(rawText),
       usage: {
         input: Number(um.promptTokenCount ?? 0),
         output: Number(um.candidatesTokenCount ?? 0),
@@ -169,10 +170,6 @@ export class GeminiProvider implements LLMProvider {
     };
   }
 }
-
-// ---------------------------------------------------------------
-// OpenAI-compatible provider
-// ---------------------------------------------------------------
 
 export class OpenAICompatibleProvider implements LLMProvider {
   constructor(
@@ -192,6 +189,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       model: this.model,
       messages,
       temperature: 0.2,
+      max_tokens: MAX_OUTPUT_TOKENS,
     };
     if (req.jsonMode) {
       body.response_format = { type: "json_object" };
@@ -207,6 +205,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
           Accept: "application/json",
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
     } catch (err: any) {
       throw new Error(`fetch failed: ${err?.message ?? err}`);
@@ -214,7 +213,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
     if (!res.ok) {
       const text = await res.text();
-      // Some models reject response_format. Retry once without it.
       if (
         req.jsonMode &&
         (res.status === 400 || res.status === 422) &&
@@ -222,7 +220,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       ) {
         return this.complete({ ...req, jsonMode: false }, keyIndex);
       }
-      throw makeHttpError(res.status, text);
+      throw makeHttpError(res.status, text, res.headers);
     }
 
     const json: any = await res.json();
@@ -232,7 +230,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const usage = json?.usage ?? {};
 
     return {
-      text: stripThinking(rawText),
+      text: stripLeadingThinking(rawText),
       usage: {
         input: Number(usage.prompt_tokens ?? 0),
         output: Number(usage.completion_tokens ?? 0),
@@ -246,10 +244,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
   }
 }
 
-// ---------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------
-
 export function makeProvider(spec: KeySpec): LLMProvider {
   if (spec.provider === "gemini" || spec.baseURL === null) {
     return new GeminiProvider(spec.key, spec.model);
@@ -257,34 +251,56 @@ export function makeProvider(spec: KeySpec): LLMProvider {
   return new OpenAICompatibleProvider(spec.baseURL, spec.model, spec.key);
 }
 
-// ---------------------------------------------------------------
-// Error handling
-// ---------------------------------------------------------------
+interface LLMHttpError extends Error {
+  status?: number;
+  retryAfterMs?: number;
+}
 
-function makeHttpError(status: number, body: string): Error {
-  const err = new Error(`HTTP ${status}: ${body.slice(0, 400)}`) as Error & {
-    status?: number;
-  };
+function makeHttpError(
+  status: number,
+  body: string,
+  headers?: Headers,
+): LLMHttpError {
+  const err = new Error(
+    `HTTP ${status}: ${body.slice(0, 400)}`,
+  ) as LLMHttpError;
   err.status = status;
+
+  if (headers) {
+    const ra = headers.get("retry-after");
+    if (ra) {
+      const seconds = Number(ra);
+      if (!Number.isNaN(seconds)) err.retryAfterMs = seconds * 1000;
+      else {
+        const date = Date.parse(ra);
+        if (!Number.isNaN(date))
+          err.retryAfterMs = Math.max(0, date - Date.now());
+      }
+    }
+  }
+  if (!err.retryAfterMs) {
+    const m = body.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
+    if (m) err.retryAfterMs = Math.ceil(parseFloat(m[1]) * 1000);
+  }
+  if (!err.retryAfterMs) {
+    const m = body.match(/"retry_after"\s*:\s*(\d+)/i);
+    if (m) err.retryAfterMs = Number(m[1]) * 1000;
+  }
+
   return err;
 }
 
-/**
- * Strip reasoning blocks some providers emit inline.
- * Applies to DeepSeek (<think>...</think>) and Nemotron variants.
- */
-function stripThinking(text: string): string {
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+function stripLeadingThinking(text: string): string {
+  const m = text.match(/^\s*<think>[\s\S]*?<\/think>\s*/i);
+  return m ? text.slice(m[0].length) : text;
 }
 
 export function classifyError(err: unknown): LLMErrorKind {
   const e = err as any;
-
-  // Trust the HTTP status when present. Do NOT use e.code — Node sets it
-  // to strings like ECONNRESET or ETIMEDOUT for network errors.
   const status = Number(e?.status ?? e?.response?.status) || undefined;
   if (status) {
     if (status === 429) return "quota";
+    if (status === 413) return "rotate";
     if (status === 401 || status === 403 || status === 404 || status === 410) {
       return "rotate";
     }
@@ -292,10 +308,9 @@ export function classifyError(err: unknown): LLMErrorKind {
     return "fatal";
   }
 
-  // No HTTP status. Classify by message.
   const msg = String(e?.message ?? e ?? "");
   if (/\b429\b|quota exceeded|rate limit exceeded/i.test(msg)) return "quota";
-  if (/\b40[134]\b|\b410\b/i.test(msg)) return "rotate";
+  if (/\b41[03]\b|\b40[134]\b/i.test(msg)) return "rotate";
   if (
     /\b50[0234]\b|UNAVAILABLE|high demand|overloaded|temporarily unavailable/i.test(
       msg,
@@ -304,12 +319,11 @@ export function classifyError(err: unknown): LLMErrorKind {
     return "retryable";
   }
   if (
-    /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network/i.test(
+    /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network|aborted|timeout/i.test(
       msg,
     )
   ) {
     return "retryable";
   }
-
   return "fatal";
 }

@@ -15,7 +15,15 @@ import {
   type KeySpec,
   type LLMProvider,
   type LLMMessage,
-} from "./llm.js";
+} from "./src/llm.js";
+import {
+  loadKeyState,
+  saveKeyState,
+  fingerprint,
+  isPerDayLimit,
+  resetTimeFor,
+  type KeysFile,
+} from "./src/keystate.js";
 
 const exec = promisify(execFile);
 
@@ -25,7 +33,7 @@ const exec = promisify(execFile);
 
 const WALL_CLOCK_MS = 15 * 60 * 1000;
 const MAX_CONSECUTIVE_ERRORS = 3;
-const MAX_LLM_RETRIES = 6;
+const MAX_LLM_RETRIES = 3;
 const MAX_PATCH_BYTES = 5 * 1024 * 1024;
 const MAX_PR_BODY_CHARS = 60_000;
 const MAX_BASH_OUT = 1_000_000;
@@ -35,6 +43,8 @@ const MAX_FILE_BYTES = 500 * 1024;
 
 const SENTINEL_MORE = "<<<OMAH_MORE>>>";
 const SENTINEL_END = "<<<OMAH_END>>>";
+
+const RETRYABLE_PROVIDER_COOLDOWN_MS = 5 * 60 * 1000;
 
 const TOOL_NAMES = new Set<string>([
   "read_file",
@@ -143,6 +153,16 @@ interface StepUsage {
 
 const usageLog: StepUsage[] = [];
 const keyStats: Map<number, KeyStat> = new Map();
+const cooldownUntil: Map<number, number> = new Map();
+
+let persistedKeyState: KeysFile = {
+  version: 1,
+  updated_at: new Date().toISOString(),
+  keys: {},
+};
+let metaToken = "";
+let stateLoadOk = false;
+let stateSaved = false;
 
 function recordKeyCall(keyIndex: number): void {
   const s = keyStats.get(keyIndex) ?? { calls: 0, rate429: 0, errors: 0 };
@@ -162,6 +182,29 @@ function recordKeyError(keyIndex: number, message: string): void {
   s.errors += 1;
   s.lastError = message.slice(0, 300);
   keyStats.set(keyIndex, s);
+}
+
+// ---------------------------------------------------------------
+// Key picker
+// ---------------------------------------------------------------
+
+type PickResult =
+  | { kind: "ready"; index: number }
+  | { kind: "wait"; waitMs: number }
+  | { kind: "exhausted" };
+
+function pickKey(keys: KeySpec[], start: number): PickResult {
+  const now = Date.now();
+  for (let i = 0; i < keys.length; i++) {
+    const idx = (start + i) % keys.length;
+    if ((cooldownUntil.get(idx) ?? 0) <= now) return { kind: "ready", index: idx };
+  }
+  let earliest = Infinity;
+  for (const t of cooldownUntil.values()) {
+    if (Number.isFinite(t) && t < earliest) earliest = t;
+  }
+  if (!Number.isFinite(earliest)) return { kind: "exhausted" };
+  return { kind: "wait", waitMs: Math.max(0, earliest - now) + 500 };
 }
 
 // ---------------------------------------------------------------
@@ -268,6 +311,29 @@ async function main(): Promise<void> {
   const appToken = await mintAppToken(appJwt, targetRepo);
   console.log(`::add-mask::${appToken}`);
 
+  const metaRepo = process.env.OMAH_META_REPO;
+  if (metaRepo) {
+    try {
+      metaToken = await mintAppToken(appJwt, metaRepo);
+      console.log(`::add-mask::${metaToken}`);
+    } catch (e: any) {
+      await log(
+        `keystate: no meta token (${e?.message ?? e}); persistence disabled`,
+      );
+    }
+  } else {
+    await log("keystate: OMAH_META_REPO not set; persistence disabled");
+  }
+
+  if (metaToken) {
+    const loaded = await loadKeyState(metaToken, log);
+    persistedKeyState = loaded.state;
+    stateLoadOk = loaded.ok;
+    await log(
+      `keystate: loaded ${Object.keys(persistedKeyState.keys).length} entries (ok=${stateLoadOk})`,
+    );
+  }
+
   const { botId, appSlug } = await resolveAppIdentity(appJwt);
   const botName = `${appSlug}[bot]`;
   const botEmail = `${botId}+${appSlug}[bot]@users.noreply.github.com`;
@@ -330,24 +396,66 @@ async function main(): Promise<void> {
   setupMs = Date.now() - runStarted;
 
   const systemPrompt = await fs.readFile(SYSTEM_PROMPT_PATH, "utf8");
-  const keys = loadKeys();
+  let keys = loadKeys();
+  const fullKeys = keys;
+
+  const now = Date.now();
+  const before = keys.length;
+  keys = keys.filter((k) => {
+    const fp = fingerprint(k.provider, k.key);
+    const entry = persistedKeyState.keys[fp];
+    if (!entry) return true;
+    if (!entry.reset_at) return true;
+    const resetAt = Date.parse(entry.reset_at);
+    if (Number.isNaN(resetAt)) return true;
+    if (resetAt <= now) return true;
+    return false;
+  });
+
+  if (keys.length === 0) {
+    await log("keystate: all keys marked exhausted; trying anyway");
+    keys = fullKeys;
+  } else if (keys.length < before) {
+    await log(`keystate: skipped ${before - keys.length} exhausted key(s)`);
+  }
+
   await log(
     `loaded ${keys.length} keys: ` +
       keys.map((k, i) => `${i + 1}=${k.provider}`).join(", "),
   );
+
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
 
-  const result = await runLoop({
-    systemPrompt,
-    task: taskText,
-    resumeText,
-    conversation,
-    keys,
-    targetRepo,
-    branchName,
-    appToken,
-    startSha,
-  });
+  let result: RunLoopResult;
+  try {
+    result = await runLoop({
+      systemPrompt,
+      task: taskText,
+      resumeText,
+      conversation,
+      keys,
+      targetRepo,
+      branchName,
+      appToken,
+      startSha,
+    });
+  } finally {
+    if (metaToken && stateLoadOk && !stateSaved) {
+      stateSaved = true;
+      await saveKeyState(persistedKeyState, metaToken, log);
+    }
+    const llmMs = usageLog.reduce((a, u) => a + u.ms, 0);
+    writeRunSummary(
+      buildUsageSummary({
+        totalMs: Date.now() - runStarted,
+        llmMs,
+        setupMs,
+        pushMs,
+        keysTotal: keys.length,
+        keySpecs: keys,
+      }),
+    );
+  }
 
   conversation.finished = true;
   conversation.summary = result.summary;
@@ -358,9 +466,7 @@ async function main(): Promise<void> {
   if (process.env.OMAH_SCRIPT) {
     try {
       await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
-    } catch {
-      // Hostile-test only; ignore failures.
-    }
+    } catch {}
   }
   await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
 
@@ -382,18 +488,6 @@ async function main(): Promise<void> {
     setOutput("pr_url", prUrl);
   }
   setOutput("status", result.status);
-
-  const llmMs = usageLog.reduce((a, u) => a + u.ms, 0);
-  writeRunSummary(
-    buildUsageSummary({
-      totalMs: Date.now() - runStarted,
-      llmMs,
-      setupMs,
-      pushMs,
-      keysTotal: keys.length,
-      keySpecs: keys,
-    }),
-  );
 
   await log(`done. pr=${prUrl || "(none)"} status=${result.status}`);
 }
@@ -488,6 +582,24 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       };
     }
 
+    // Pick the next ready key. Sleep if all are cooling, block if all
+    // are dead for the day.
+    const pick = pickKey(args.keys, keyIndex);
+    if (pick.kind === "exhausted") {
+      return {
+        summary: "All LLM keys are exhausted for the day.",
+        status: "blocked",
+      };
+    }
+    if (pick.kind === "wait") {
+      await log(
+        `all keys cooling; sleeping ${Math.round(pick.waitMs / 1000)}s until earliest wake`,
+      );
+      await sleep(pick.waitMs);
+      continue;
+    }
+    keyIndex = pick.index;
+
     const keySpec = args.keys[keyIndex];
     const provider: LLMProvider = makeProvider(keySpec);
 
@@ -508,62 +620,86 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         output: result.usage.output,
         thoughts: result.usage.thoughts,
         ms: result.usage.ms,
-        tool: "(pending)",
+        tool: writeState ? "write_content" : "(pending)",
       });
       await log(
-        `[step ${stepForLog}] llm: provider=${keySpec.provider} ` +
+        `[step ${stepForLog}] llm: provider=${keySpec.provider} model=${keySpec.model} ` +
           `in=${result.usage.input} out=${result.usage.output}` +
           (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
           ` ms=${result.usage.ms} key=${keyIndex + 1}`,
       );
     } catch (err) {
       const kind = classifyError(err);
-      if (kind !== "fatal") {
-        const waitMs = kind === "retryable" ? 2000 : 0;
-        if (waitMs > 0) await sleep(waitMs);
+      const errAny = err as any;
 
-        const badProvider = args.keys[keyIndex].provider;
-        const status = (err as any)?.status;
-        const providerWide = kind === "retryable" || status === 404;
+      if (kind === "quota") {
+        const ks = args.keys[keyIndex];
+        const fp = fingerprint(ks.provider, ks.key);
 
-        if (providerWide) {
-          while (
-            keyIndex < args.keys.length &&
-            args.keys[keyIndex].provider === badProvider
-          ) {
-            keyIndex += 1;
-          }
-        } else {
-          keyIndex += 1;
-        }
-
-        if (keyIndex < args.keys.length) {
+        if (isPerDayLimit(err)) {
+          cooldownUntil.set(keyIndex, Number.POSITIVE_INFINITY);
+          persistedKeyState.keys[fp] = {
+            status: "exhausted",
+            reason: "PerDay",
+            reset_at: resetTimeFor(err, ks.provider),
+            last_seen: new Date().toISOString(),
+          };
           await log(
-            `rotating to key ${keyIndex + 1}/${args.keys.length} ` +
-              `(${args.keys[keyIndex].provider}) [${kind}${
-                providerWide ? ", skipped " + badProvider : ""
-              }]`,
+            `key ${keyIndex + 1} (${ks.provider}) per-day exhausted; persisted`,
           );
-          continue;
+        } else {
+          const wait = Number(errAny?.retryAfterMs ?? 60_000);
+          cooldownUntil.set(keyIndex, Date.now() + wait);
+          await log(
+            `key ${keyIndex + 1} (${ks.provider}) cooling ${Math.round(wait / 1000)}s (per-minute)`,
+          );
         }
-        return {
-          summary: "All LLM keys are exhausted.",
-          status: "blocked",
-        };
+
+        // Move start forward so the next picker iteration doesn't return
+        // the same key.
+        keyIndex = (keyIndex + 1) % args.keys.length;
+        continue;
       }
 
-      // Fatal: report and block.
-      const errAny = err as any;
+      if (kind === "retryable") {
+        const bad = args.keys[keyIndex].provider;
+        for (let i = 0; i < args.keys.length; i++) {
+          if (args.keys[i].provider === bad) {
+            cooldownUntil.set(
+              i,
+              Date.now() + RETRYABLE_PROVIDER_COOLDOWN_MS,
+            );
+          }
+        }
+        await log(
+          `provider ${bad} cooling ${Math.round(RETRYABLE_PROVIDER_COOLDOWN_MS / 1000)}s after retryable error`,
+        );
+        keyIndex = (keyIndex + 1) % args.keys.length;
+        continue;
+      }
+
+      if (kind === "rotate") {
+        const bad = args.keys[keyIndex].provider;
+        for (let i = 0; i < args.keys.length; i++) {
+          if (args.keys[i].provider === bad) {
+            cooldownUntil.set(i, Number.POSITIVE_INFINITY);
+          }
+        }
+        await log(
+          `provider ${bad} marked dead for this run [${String(errAny?.status ?? "?")}]`,
+        );
+        keyIndex = (keyIndex + 1) % args.keys.length;
+        continue;
+      }
+
+      // fatal
       const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(
         0,
         300,
       );
       const statusCode =
         errAny?.status ?? errAny?.code ?? errAny?.response?.status;
-      const is503 = statusCode === 503 || /\b503\b|UNAVAILABLE/i.test(msg);
-      const label = is503
-        ? "LLM unavailable (503)"
-        : `LLM call failed (status=${statusCode ?? "unknown"})`;
+      const label = `LLM call failed (status=${statusCode ?? "unknown"})`;
       await log(`blocking: ${label}: ${msg}`);
       return {
         summary: `${label}: ${msg}`,
@@ -770,7 +906,8 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
               `Reply with the raw contents of ${p}. Do not wrap it in JSON, ` +
               `do not add fences, do not add explanation. End with a line ` +
               `containing only ${SENTINEL_END}. If the file is large, split ` +
-              `it: end each non-final chunk with ${SENTINEL_MORE} on its own line.`,
+              `it: end each non-final chunk with ${SENTINEL_MORE} on its own line. ` +
+              `Keep each chunk under 250 lines.`,
           },
         ],
       });
@@ -848,7 +985,7 @@ function handleRawChunk(
       message:
         `Missing ${SENTINEL_END} line, nothing was written ` +
         `(the reply may have been cut off). Call request_write again ` +
-        `and send the file in chunks of ~300 lines.`,
+        `and send the file in chunks of ~250 lines.`,
     };
   }
   lines.pop();
@@ -1773,6 +1910,9 @@ async function callModel(
         recordKeyRateLimit(keyIndex, String(err?.message ?? err));
         throw err;
       } else if (kind === "fatal" || kind === "rotate") {
+        await log(
+          `key ${keyIndex + 1} ${kind} error: ${String(err?.message ?? err).slice(0, 500)}`,
+        );
         recordKeyError(keyIndex, String(err?.message ?? err));
         throw err;
       }
@@ -1860,9 +2000,7 @@ function writeRunSummary(text: string): void {
   if (!file) return;
   try {
     appendFileSync(file, text + "\n");
-  } catch {
-    // Best-effort.
-  }
+  } catch {}
 }
 
 // ---------------------------------------------------------------
@@ -2022,8 +2160,9 @@ function loadKeys(): KeySpec[] {
     console.log(`::add-mask::${k.key}`);
   }
 
-  // Optional preference: try the named provider first, then everything else.
-  const preferred = (process.env.INPUT_PROVIDER || "default").trim().toLowerCase();
+  const preferred = (process.env.INPUT_PROVIDER || "default")
+    .trim()
+    .toLowerCase();
   if (preferred && preferred !== "default") {
     const first = specs.filter((k) => k.provider === preferred);
     const rest = specs.filter((k) => k.provider !== preferred);
@@ -2079,5 +2218,11 @@ function slugify(s: string): string {
 
 main().catch(async (err) => {
   console.error("[omah] fatal:", err);
+  if (metaToken && stateLoadOk && !stateSaved) {
+    stateSaved = true;
+    try {
+      await saveKeyState(persistedKeyState, metaToken, log);
+    } catch {}
+  }
   process.exit(1);
 });

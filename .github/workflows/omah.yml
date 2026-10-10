@@ -36,9 +36,10 @@ on:
         options:
           - default
           - gemini
-          - nvidia
+          - groq
+          - requesty
           - mistral
-          - opencode
+          - nvidia
 
 permissions:
   contents: read
@@ -162,10 +163,13 @@ jobs:
           INPUT_BRANCH: ${{ inputs.branch }}
           INPUT_RESUME_TEXT: ${{ inputs.resume_text }}
           INPUT_PROVIDER: ${{ inputs.provider }}
+          OMAH_DISABLED_PROVIDERS: ${{ vars.OMAH_DISABLED_PROVIDERS }}
+          OMAH_META_REPO: ${{ vars.OMAH_META_REPO }}
+          GROQ_KEYS: ${{ secrets.GROQ_KEYS }}
           GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}
-          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          REQUESTY_KEYS: ${{ secrets.REQUESTY_KEYS }}
           MISTRAL_KEYS: ${{ secrets.MISTRAL_KEYS }}
-          OPENCODE_KEYS: ${{ secrets.OPENCODE_KEYS }}
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
           APP_ID: ${{ secrets.OMAH_APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.OMAH_APP_PRIVATE_KEY }}
           APP_BOT_ID: ${{ vars.OMAH_APP_BOT_ID }}
