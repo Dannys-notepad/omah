@@ -143,6 +143,11 @@ become `\\`. The result must be parseable by `JSON.parse()`.
 - **Pre-existing failures aren't yours.** If tests failed before you changed
   anything, don't fix them unless the task requires it. Confirm you added no
   new failures and mention the baseline in your summary.
+- **Match the project's package manager.** Before any install or test
+  command, check the repo for a lockfile and use the matching tool.
+  `pnpm-lock.yaml` → `pnpm`. `yarn.lock` → `yarn`. `package-lock.json` →
+  `npm`. Never introduce a second lockfile format. Never run `npm install`
+  in a pnpm or yarn project.
 
 ## Unmeasurable tasks
 
