@@ -197,7 +197,9 @@ function pickKey(keys: KeySpec[], start: number): PickResult {
   const now = Date.now();
   for (let i = 0; i < keys.length; i++) {
     const idx = (start + i) % keys.length;
-    if ((cooldownUntil.get(idx) ?? 0) <= now) return { kind: "ready", index: idx };
+    if ((cooldownUntil.get(idx) ?? 0) <= now) {
+      return { kind: "ready", index: idx };
+    }
   }
   let earliest = Infinity;
   for (const t of cooldownUntil.values()) {
@@ -582,8 +584,6 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       };
     }
 
-    // Pick the next ready key. Sleep if all are cooling, block if all
-    // are dead for the day.
     const pick = pickKey(args.keys, keyIndex);
     if (pick.kind === "exhausted") {
       return {
@@ -604,6 +604,7 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
     const provider: LLMProvider = makeProvider(keySpec);
 
     let responseText: string;
+    let responseNote: string | undefined;
     const stepForLog = args.conversation.steps.length + 1;
     try {
       const result = await callModel(
@@ -614,6 +615,7 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         keyIndex,
       );
       responseText = result.text;
+      responseNote = result.note;
       usageLog.push({
         step: stepForLog,
         input: result.usage.input,
@@ -622,13 +624,13 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         ms: result.usage.ms,
         tool: writeState ? "write_content" : "(pending)",
       });
-await log(
-  `[step ${stepForLog}] llm: provider=${keySpec.provider} model=${keySpec.model} ` +
-    `in=${result.usage.input} out=${result.usage.output}` +
-    (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
-    ` ms=${result.usage.ms} key=${keyIndex + 1}` +
-    (result.note ? ` ${result.note}` : ""),
-);
+      await log(
+        `[step ${stepForLog}] llm: provider=${keySpec.provider} model=${keySpec.model} ` +
+          `in=${result.usage.input} out=${result.usage.output}` +
+          (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
+          ` ms=${result.usage.ms} key=${keyIndex + 1}` +
+          (responseNote ? ` ${responseNote}` : ""),
+      );
     } catch (err) {
       const kind = classifyError(err);
       const errAny = err as any;
@@ -656,8 +658,6 @@ await log(
           );
         }
 
-        // Move start forward so the next picker iteration doesn't return
-        // the same key.
         keyIndex = (keyIndex + 1) % args.keys.length;
         continue;
       }
@@ -693,7 +693,6 @@ await log(
         continue;
       }
 
-      // fatal
       const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(
         0,
         300,
@@ -813,27 +812,25 @@ await log(
     }
 
     const parsed = parseModelOutput(responseText);
-if (!parsed) {
-  await log(`could not parse model output (${responseText.length} chars):`);
-  await log(responseText.slice(0, 2000));
-  consecutiveErrors += 1;
-  // Some OpenAI-compatible endpoints reject empty assistant messages
-  // with a 400. Use a placeholder when the reply was blank.
-  const echoed = responseText.trim() ? responseText : "[empty reply]";
-  history.push({ role: "model", parts: [{ text: echoed }] });
-  history.push({
-    role: "user",
-    parts: [
-      {
-        text:
-          "Your previous message did not contain a valid tool call. " +
-          "Respond with a single JSON object: " +
-          '{"reasoning": "...", "tool": "...", "args": {...}}',
-      },
-    ],
-  });
-  continue;
-}
+    if (!parsed) {
+      await log(`could not parse model output (${responseText.length} chars):`);
+      await log(responseText.slice(0, 2000));
+      consecutiveErrors += 1;
+      const echoed = responseText.trim() ? responseText : "[empty reply]";
+      history.push({ role: "model", parts: [{ text: echoed }] });
+      history.push({
+        role: "user",
+        parts: [
+          {
+            text:
+              "Your previous message did not contain a valid tool call. " +
+              "Respond with a single JSON object: " +
+              '{"reasoning": "...", "tool": "...", "args": {...}}',
+          },
+        ],
+      });
+      continue;
+    }
 
     const step = args.conversation.steps.length + 1;
     await log(`[step ${step}] ${parsed.tool}`);
@@ -1833,7 +1830,7 @@ async function loadConversation(
 }
 
 // ---------------------------------------------------------------
-// LLM (delegated to llm.ts)
+// LLM (delegated to src/llm.ts)
 // ---------------------------------------------------------------
 
 let scriptedResponses: string[] | null = null;
@@ -1855,7 +1852,7 @@ async function callModel(
   history: Message[],
   jsonMode: boolean,
   keyIndex: number,
-): Promise<{ text: string; usage: UsageInfo }> {
+): Promise<{ text: string; usage: UsageInfo; note?: string }> {
   if (process.env.OMAH_SCRIPT) {
     if (scriptedResponses === null) {
       try {
@@ -1899,7 +1896,11 @@ async function callModel(
         keyIndex,
       );
       recordKeyCall(keyIndex);
-      return result;
+      return {
+        text: result.text,
+        usage: result.usage,
+        note: result.note,
+      };
     } catch (err: any) {
       lastErr = err;
       const kind = classifyError(err);
@@ -1915,10 +1916,6 @@ async function callModel(
         throw err;
       }
 
-      // JSON-validation failures from structured-output modes are
-      // deterministic: retrying the same request usually produces the
-      // same rejection. Skip the retry budget and let runLoop cool the
-      // provider and rotate.
       if (
         (err as any)?.status === 400 &&
         /json_validate_failed|Failed to validate JSON|Failed to generate JSON/i.test(
@@ -2040,14 +2037,9 @@ function parseModelOutput(text: string): ParsedOutput | null {
   let raw = text.trim();
   raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
 
-  // Try the whole string first.
   const direct = tryParse(raw);
   if (direct) return direct;
 
-  // Otherwise extract a balanced { ... } span. Try from the end backward,
-  // because reasoning text often contains a draft object before the real
-  // tool call. An inner args object fails the tool check, so the loop
-  // reaches the outer envelope.
   return extractToolCall(raw);
 }
 
