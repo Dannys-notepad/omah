@@ -1,0 +1,59 @@
+name: Omah cleanup
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repo to wipe (owner/name). Blank = all repos in repositories.json."
+        required: false
+        type: string
+      confirm:
+        description: "Type DELETE to confirm the manual wipe"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: omah-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run cleanup
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_CONFIRM: ${{ inputs.confirm }}
+          APP_ID: ${{ secrets.OMAH_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.OMAH_APP_PRIVATE_KEY }}
+          OMAH_META_REPO: ${{ vars.OMAH_META_REPO }}
+          GH_ACTIONS_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ vars.OMAH_CLEANUP_DRY_RUN }}
+        run: npx tsx cleanup.ts
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Cleanup result"
+            echo ""
+            echo "See the Run cleanup step for the per-repo log."
+          } >> "$GITHUB_STEP_SUMMARY"

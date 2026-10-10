@@ -17,12 +17,13 @@ import {
   type LLMMessage,
 } from "./src/llm.js";
 import {
-  loadKeyState,
-  saveKeyState,
+  loadState,
+  saveState,
+  addRepo,
   fingerprint,
   isPerDayLimit,
   resetTimeFor,
-  type KeysFile,
+  type State,
 } from "./src/keystate.js";
 
 const exec = promisify(execFile);
@@ -155,10 +156,9 @@ const usageLog: StepUsage[] = [];
 const keyStats: Map<number, KeyStat> = new Map();
 const cooldownUntil: Map<number, number> = new Map();
 
-let persistedKeyState: KeysFile = {
-  version: 1,
-  updated_at: new Date().toISOString(),
-  keys: {},
+let persistedState: State = {
+  keys: { version: 1, updated_at: new Date().toISOString(), keys: {} },
+  repos: { version: 1, updated_at: new Date().toISOString(), repos: [] },
 };
 let metaToken = "";
 let stateLoadOk = false;
@@ -328,12 +328,18 @@ async function main(): Promise<void> {
   }
 
   if (metaToken) {
-    const loaded = await loadKeyState(metaToken, log);
-    persistedKeyState = loaded.state;
+    const loaded = await loadState(metaToken, log);
+    persistedState = loaded.state;
     stateLoadOk = loaded.ok;
     await log(
-      `keystate: loaded ${Object.keys(persistedKeyState.keys).length} entries (ok=${stateLoadOk})`,
+      `keystate: loaded ${Object.keys(persistedState.keys.keys).length} keys, ` +
+        `${persistedState.repos.repos.length} repos (ok=${stateLoadOk})`,
     );
+  }
+
+  // Record this target repo in the state (persisted at save time).
+  if (addRepo(persistedState, targetRepo)) {
+    await log(`keystate: new target repo "${targetRepo}" will be recorded`);
   }
 
   const { botId, appSlug } = await resolveAppIdentity(appJwt);
@@ -405,7 +411,7 @@ async function main(): Promise<void> {
   const before = keys.length;
   keys = keys.filter((k) => {
     const fp = fingerprint(k.provider, k.key);
-    const entry = persistedKeyState.keys[fp];
+    const entry = persistedState.keys.keys[fp];
     if (!entry) return true;
     if (!entry.reset_at) return true;
     const resetAt = Date.parse(entry.reset_at);
@@ -444,7 +450,7 @@ async function main(): Promise<void> {
   } finally {
     if (metaToken && stateLoadOk && !stateSaved) {
       stateSaved = true;
-      await saveKeyState(persistedKeyState, metaToken, log);
+      await saveState(persistedState, metaToken, log);
     }
     const llmMs = usageLog.reduce((a, u) => a + u.ms, 0);
     writeRunSummary(
@@ -641,7 +647,7 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
 
         if (isPerDayLimit(err)) {
           cooldownUntil.set(keyIndex, Number.POSITIVE_INFINITY);
-          persistedKeyState.keys[fp] = {
+          persistedState.keys.keys[fp] = {
             status: "exhausted",
             reason: "PerDay",
             reset_at: resetTimeFor(err, ks.provider),
@@ -720,13 +726,13 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         await log(`write error [${outcome.code}]: ${outcome.message}`);
 
         history.push({
-  role: "model",
-  parts: [{ text: "[attempted JSON tool call instead of raw content]" }],
-});
-history.push({
-  role: "user",
-  parts: [{ text: `Tool result (error):\n${outcome.message}` }],
-});
+          role: "model",
+          parts: [{ text: "[attempted JSON tool call instead of raw content]" }],
+        });
+        history.push({
+          role: "user",
+          parts: [{ text: `Tool result (error):\n${outcome.message}` }],
+        });
         args.conversation.steps.push({
           step: args.conversation.steps.length + 1,
           reasoning: pendingWriteReasoning,
@@ -2285,7 +2291,7 @@ main().catch(async (err) => {
   if (metaToken && stateLoadOk && !stateSaved) {
     stateSaved = true;
     try {
-      await saveKeyState(persistedKeyState, metaToken, log);
+      await saveState(persistedState, metaToken, log);
     } catch {}
   }
   process.exit(1);

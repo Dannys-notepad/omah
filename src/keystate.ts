@@ -1,5 +1,10 @@
 // keystate.ts
-// Best-effort persistence of key exhaustion state across runs.
+// Persistence for key exhaustion state AND the list of target repos,
+// both stored on the omah-meta orphan branch.
+//
+// The two files live on the same branch and are written in one commit,
+// because a fresh orphan commit replaces the entire tree. Saving them
+// separately would wipe one when writing the other.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -12,8 +17,13 @@ const exec = promisify(execFile);
 
 const META_BRANCH = "omah-meta";
 const KEYS_FILE = "keys.json";
+const REPOS_FILE = "repositories.json";
 const META_REPO_ENV = "OMAH_META_REPO";
 const MAX_UNKNOWN_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------
 
 export interface KeyState {
   status: "exhausted";
@@ -28,21 +38,54 @@ export interface KeysFile {
   keys: Record<string, KeyState>;
 }
 
+export interface ReposFile {
+  version: 1;
+  updated_at: string;
+  repos: string[];
+}
+
+export interface State {
+  keys: KeysFile;
+  repos: ReposFile;
+}
+
+export interface LoadResult {
+  state: State;
+  ok: boolean;
+}
+
+// ---------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------
+
 export function fingerprint(provider: string, key: string): string {
   const h = createHash("sha256").update(key).digest("hex").slice(0, 8);
   return `${provider}:${h}`;
 }
 
-export interface LoadResult {
-  state: KeysFile;
-  ok: boolean;
+function emptyState(): State {
+  return {
+    keys: { version: 1, updated_at: new Date().toISOString(), keys: {} },
+    repos: { version: 1, updated_at: new Date().toISOString(), repos: [] },
+  };
 }
 
-function emptyState(): KeysFile {
-  return { version: 1, updated_at: new Date().toISOString(), keys: {} };
+/**
+ * Add a repo to the state list if it isn't already present.
+ * Mutates state.repos.repos in place. Returns true if added.
+ */
+export function addRepo(state: State, repo: string): boolean {
+  if (!repo || typeof repo !== "string") return false;
+  if (state.repos.repos.includes(repo)) return false;
+  state.repos.repos.push(repo);
+  return true;
 }
 
-export async function loadKeyState(
+// ---------------------------------------------------------------
+// Load / save
+// ---------------------------------------------------------------
+
+export async function loadState(
   token: string,
   log: (msg: string) => Promise<void>,
 ): Promise<LoadResult> {
@@ -67,9 +110,9 @@ export async function loadKeyState(
     );
     if (r.code !== 0) {
       const stderr = r.stderr || "";
-      // Only a genuinely-missing remote branch means "empty but authoritative".
-      // Do not match generic "repository ... not found" (auth failures).
-      if (/Remote branch .* not found|Could not find remote branch/i.test(stderr)) {
+      if (
+        /Remote branch .* not found|Could not find remote branch/i.test(stderr)
+      ) {
         await log("keystate: no existing state (branch absent)");
         return { state: emptyState(), ok: true };
       }
@@ -78,29 +121,55 @@ export async function loadKeyState(
       );
       return { state: emptyState(), ok: false };
     }
-    const raw = await fs.readFile(path.join(tmp, KEYS_FILE), "utf8");
-    let parsed: KeysFile;
+
+    let keys: KeysFile = emptyState().keys;
+    let repos: ReposFile = emptyState().repos;
+
     try {
-      parsed = JSON.parse(raw) as KeysFile;
+      const raw = await fs.readFile(path.join(tmp, KEYS_FILE), "utf8");
+      const parsed = JSON.parse(raw) as KeysFile;
+      if (parsed?.version === 1 && typeof parsed.keys === "object") {
+        keys = parsed;
+      } else {
+        await log("keystate: keys.json has unexpected shape; ignoring");
+      }
     } catch (err: any) {
-      await log(`keystate: file is not valid JSON: ${err?.message ?? err}`);
-      return { state: emptyState(), ok: false };
+      if ((err as any)?.code !== "ENOENT") {
+        await log(
+          `keystate: keys.json read failed: ${String(err?.message ?? err).slice(0, 200)}`,
+        );
+      }
     }
-    if (parsed?.version !== 1 || typeof parsed.keys !== "object") {
-      await log("keystate: unexpected file shape; ignoring");
-      return { state: emptyState(), ok: false };
+
+    try {
+      const raw = await fs.readFile(path.join(tmp, REPOS_FILE), "utf8");
+      const parsed = JSON.parse(raw) as ReposFile;
+      if (parsed?.version === 1 && Array.isArray(parsed.repos)) {
+        repos = parsed;
+      } else {
+        await log("keystate: repositories.json has unexpected shape; ignoring");
+      }
+    } catch (err: any) {
+      if ((err as any)?.code !== "ENOENT") {
+        await log(
+          `keystate: repositories.json read failed: ${String(err?.message ?? err).slice(0, 200)}`,
+        );
+      }
     }
-    return { state: parsed, ok: true };
+
+    return { state: { keys, repos }, ok: true };
   } catch (err: any) {
-    await log(`keystate: load failed: ${String(err?.message ?? err).slice(0, 200)}`);
+    await log(
+      `keystate: load failed: ${String(err?.message ?? err).slice(0, 200)}`,
+    );
     return { state: emptyState(), ok: false };
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
 }
 
-export async function saveKeyState(
-  state: KeysFile,
+export async function saveState(
+  state: State,
   token: string,
   log: (msg: string) => Promise<void>,
 ): Promise<void> {
@@ -115,11 +184,11 @@ export async function saveKeyState(
   }
 
   const now = Date.now();
-  for (const [fp, entry] of Object.entries(state.keys)) {
+  for (const [fp, entry] of Object.entries(state.keys.keys)) {
     if (!entry.reset_at) continue;
     const resetAt = Date.parse(entry.reset_at);
     if (!Number.isNaN(resetAt) && resetAt <= now) {
-      delete state.keys[fp];
+      delete state.keys.keys[fp];
     }
   }
 
@@ -141,12 +210,21 @@ export async function saveKeyState(
     });
     if (r.code !== 0) throw new Error(`checkout: ${r.stderr}`);
 
-    state.updated_at = new Date().toISOString();
+    state.keys.updated_at = new Date().toISOString();
+    state.repos.updated_at = new Date().toISOString();
+
     await fs.writeFile(
       path.join(tmp, KEYS_FILE),
-      JSON.stringify(state, null, 2),
+      JSON.stringify(state.keys, null, 2),
     );
-    r = await execOrchestrator("git", ["add", KEYS_FILE], { cwd: tmp });
+    await fs.writeFile(
+      path.join(tmp, REPOS_FILE),
+      JSON.stringify(state.repos, null, 2),
+    );
+
+    r = await execOrchestrator("git", ["add", KEYS_FILE, REPOS_FILE], {
+      cwd: tmp,
+    });
     if (r.code !== 0) throw new Error(`add: ${r.stderr}`);
 
     r = await execOrchestrator(
@@ -158,7 +236,7 @@ export async function saveKeyState(
         "user.email=omah[bot]@users.noreply.github.com",
         "commit",
         "-m",
-        "omah: key state",
+        "omah: state",
       ],
       { cwd: tmp },
     );
@@ -180,6 +258,10 @@ export async function saveKeyState(
     await fs.rm(tmp, { recursive: true, force: true });
   }
 }
+
+// ---------------------------------------------------------------
+// Reset time
+// ---------------------------------------------------------------
 
 export function isPerDayLimit(err: unknown): boolean {
   const msg = String((err as any)?.message ?? err ?? "");
@@ -216,6 +298,10 @@ function nextPacificMidnightMs(): number {
     offsetHours * 3600 * 1000;
   return nextMidnightUtc;
 }
+
+// ---------------------------------------------------------------
+// Internal
+// ---------------------------------------------------------------
 
 function gitAuthEnv(token: string): Record<string, string> {
   const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
