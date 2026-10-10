@@ -253,7 +253,7 @@ const usage = json?.usage ?? {};
         ms: elapsed,
         keyIndex,
       },
-      note,
+      //note,
     };
   }
 }
