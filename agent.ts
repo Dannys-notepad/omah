@@ -343,7 +343,6 @@ async function main(): Promise<void> {
   }
 
   const { botId, appSlug } = await resolveAppIdentity(appJwt);
-  const { botId, appSlug } = await resolveAppIdentity(appJwt);
   
   const botName = `${appSlug}[bot]`;
   const botEmail = `${botId}+${appSlug}[bot]@users.noreply.github.com`;
