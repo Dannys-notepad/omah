@@ -1909,7 +1909,26 @@ async function callModel(
         }
         recordKeyRateLimit(keyIndex, String(err?.message ?? err));
         throw err;
-      } else if (kind === "fatal" || kind === "rotate") {
+      }
+
+      // JSON-validation failures from structured-output modes are
+      // deterministic: retrying the same request usually produces the
+      // same rejection. Skip the retry budget and let runLoop cool the
+      // provider and rotate.
+      if (
+        (err as any)?.status === 400 &&
+        /json_validate_failed|Failed to validate JSON|Failed to generate JSON/i.test(
+          String((err as any)?.message ?? ""),
+        )
+      ) {
+        await log(
+          `key ${keyIndex + 1} json validation failure; not retrying`,
+        );
+        recordKeyError(keyIndex, String(err?.message ?? err));
+        throw err;
+      }
+
+      if (kind === "fatal" || kind === "rotate") {
         await log(
           `key ${keyIndex + 1} ${kind} error: ${String(err?.message ?? err).slice(0, 500)}`,
         );
