@@ -2090,7 +2090,11 @@ function tryParse(s: string): ParsedOutput | null {
     const obj = JSON.parse(s);
     if (typeof obj?.tool !== "string") return null;
 
-    // Standard: { reasoning, tool, args }
+    // Validate the tool name here, so an unknown tool produces a clean
+    // parse failure (and a retry), rather than reaching the loop.
+    if (!TOOL_NAMES.has(obj.tool)) return null;
+
+    // Standard: {"reasoning": "...", "tool": "...", "args": {...}}
     if (typeof obj?.args === "object" && obj.args !== null) {
       return {
         reasoning: String(obj.reasoning ?? ""),
@@ -2099,14 +2103,19 @@ function tryParse(s: string): ParsedOutput | null {
       };
     }
 
-    // Poolside-flat: { reasoning, tool, command } or similar.
-    // Everything except reasoning and tool becomes args.
+    // If `args` is present but not an object, the call is malformed —
+    // do not fall through to the flat branch.
+    if ("args" in obj) return null;
+
+    // Flat form: {"reasoning": "...", "tool": "...", "<param>": value}
+    // Some providers (Poolside / Laguna S) put tool parameters at the
+    // top level. Everything except `reasoning` and `tool` becomes args.
     const { reasoning, tool, ...rest } = obj;
     if (Object.keys(rest).length === 0) return null;
     return {
       reasoning: String(reasoning ?? ""),
       tool: tool as ToolName,
-      args: rest,
+      args: rest as Record<string, unknown>,
     };
   } catch {
     return null;

@@ -61,6 +61,12 @@ Args for each tool:
 - git_commit: {"message"}
 - finish: {"summary", "status"}
 
+Every tool call must have exactly three fields: `reasoning`, `tool`, and
+`args`. The tool's parameters go inside `args`, never at the top level.
+
+Correct:   {"reasoning": "Listing files.", "tool": "run_bash", "args": {"command": "ls -la"}}
+Incorrect: {"reasoning": "Listing files.", "tool": "run_bash", "command": "ls -la"}
+
 Put your thinking in the `reasoning` field. The user reads it. Do not emit any
 text outside the JSON object.
 
