@@ -25,6 +25,8 @@ export interface UsageInfo {
 export interface LLMResponse {
   text: string;
   usage: UsageInfo;
+  /** Optional diagnostic note from the provider (not shown to the model). */
+  note?: string;
 }
 
 export interface LLMProvider {
@@ -218,10 +220,27 @@ export class OpenAICompatibleProvider implements LLMProvider {
     }
 
     const json: any = await res.json();
-    const elapsed = Date.now() - started;
-    const choice = json?.choices?.[0];
-    const rawText = choice?.message?.content ?? "";
-    const usage = json?.usage ?? {};
+const elapsed = Date.now() - started;
+const choice = json?.choices?.[0];
+const message = choice?.message ?? {};
+const finish = choice?.finish_reason;
+
+let rawText = String(message.content ?? "");
+// Some OpenAI-compatible providers (notably Groq with gpt-oss models)
+// return the useful text in `reasoning` and leave `content` empty.
+// Only use reasoning on JSON-mode turns — never on raw file writes,
+// where reasoning text would corrupt the file — and never when the
+// reply was cut off.
+if (
+  !rawText.trim() &&
+  req.jsonMode &&
+  finish !== "length" &&
+  message.reasoning
+) {
+  rawText = String(message.reasoning);
+}
+
+const usage = json?.usage ?? {};
 
     return {
       text: stripLeadingThinking(rawText),
@@ -234,6 +253,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         ms: elapsed,
         keyIndex,
       },
+      note,
     };
   }
 }
@@ -322,3 +342,5 @@ export function classifyError(err: unknown): LLMErrorKind {
   }
   return "fatal";
 }
+
+

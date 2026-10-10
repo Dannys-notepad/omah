@@ -622,12 +622,13 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         ms: result.usage.ms,
         tool: writeState ? "write_content" : "(pending)",
       });
-      await log(
-        `[step ${stepForLog}] llm: provider=${keySpec.provider} model=${keySpec.model} ` +
-          `in=${result.usage.input} out=${result.usage.output}` +
-          (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
-          ` ms=${result.usage.ms} key=${keyIndex + 1}`,
-      );
+await log(
+  `[step ${stepForLog}] llm: provider=${keySpec.provider} model=${keySpec.model} ` +
+    `in=${result.usage.input} out=${result.usage.output}` +
+    (result.usage.thoughts ? ` thoughts=${result.usage.thoughts}` : "") +
+    ` ms=${result.usage.ms} key=${keyIndex + 1}` +
+    (result.note ? ` ${result.note}` : ""),
+);
     } catch (err) {
       const kind = classifyError(err);
       const errAny = err as any;
@@ -812,24 +813,27 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
     }
 
     const parsed = parseModelOutput(responseText);
-    if (!parsed) {
-      await log(`could not parse model output (${responseText.length} chars):`);
-      await log(responseText.slice(0, 2000));
-      consecutiveErrors += 1;
-      history.push({ role: "model", parts: [{ text: responseText }] });
-      history.push({
-        role: "user",
-        parts: [
-          {
-            text:
-              "Your previous message did not contain a valid tool call. " +
-              "Respond with a single JSON object: " +
-              '{"reasoning": "...", "tool": "...", "args": {...}}',
-          },
-        ],
-      });
-      continue;
-    }
+if (!parsed) {
+  await log(`could not parse model output (${responseText.length} chars):`);
+  await log(responseText.slice(0, 2000));
+  consecutiveErrors += 1;
+  // Some OpenAI-compatible endpoints reject empty assistant messages
+  // with a 400. Use a placeholder when the reply was blank.
+  const echoed = responseText.trim() ? responseText : "[empty reply]";
+  history.push({ role: "model", parts: [{ text: echoed }] });
+  history.push({
+    role: "user",
+    parts: [
+      {
+        text:
+          "Your previous message did not contain a valid tool call. " +
+          "Respond with a single JSON object: " +
+          '{"reasoning": "...", "tool": "...", "args": {...}}',
+      },
+    ],
+  });
+  continue;
+}
 
     const step = args.conversation.steps.length + 1;
     await log(`[step ${step}] ${parsed.tool}`);
@@ -2035,8 +2039,54 @@ interface ParsedOutput {
 function parseModelOutput(text: string): ParsedOutput | null {
   let raw = text.trim();
   raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+
+  // Try the whole string first.
+  const direct = tryParse(raw);
+  if (direct) return direct;
+
+  // Otherwise extract a balanced { ... } span. Try from the end backward,
+  // because reasoning text often contains a draft object before the real
+  // tool call. An inner args object fails the tool check, so the loop
+  // reaches the outer envelope.
+  return extractToolCall(raw);
+}
+
+function extractToolCall(text: string): ParsedOutput | null {
+  const starts: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "{") starts.push(i);
+  }
+  for (let k = starts.length - 1; k >= 0; k--) {
+    const end = matchBrace(text, starts[k]);
+    if (end === -1) continue;
+    const p = tryParse(text.slice(starts[k], end + 1));
+    if (p) return p;
+  }
+  return null;
+}
+
+function matchBrace(s: string, start: number): number {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+function tryParse(s: string): ParsedOutput | null {
   try {
-    const obj = JSON.parse(raw);
+    const obj = JSON.parse(s);
     if (
       typeof obj?.tool !== "string" ||
       typeof obj?.args !== "object" ||
