@@ -343,8 +343,13 @@ async function main(): Promise<void> {
   }
 
   const { botId, appSlug } = await resolveAppIdentity(appJwt);
+  const { botId, appSlug } = await resolveAppIdentity(appJwt);
+  
   const botName = `${appSlug}[bot]`;
   const botEmail = `${botId}+${appSlug}[bot]@users.noreply.github.com`;
+
+const authorName = process.env.AUTHOR_NAME || botName;
+const authorEmail = process.env.AUTHOR_EMAIL || botEmail;
 
   const client = githubClient(appToken);
   const repoInfo = await getRepo(client, targetRepo);
@@ -395,7 +400,7 @@ async function main(): Promise<void> {
   const mergedPatterns = [...ignorePatterns, ...repoIgnore];
 
   await applyIgnoreList(mergedPatterns);
-  await configureGitIdentityAsAgent(botName, botEmail);
+  await configureGitIdentityAsAgent(authorName, authorEmail);
 
   const { stdout: startShaOut } = await asAgent("git", ["rev-parse", "HEAD"]);
   const startSha = startShaOut.trim();
@@ -480,16 +485,18 @@ async function main(): Promise<void> {
 
   const pushStart = Date.now();
   const prUrl = await pushPatchAndOpenPR({
-    appToken,
-    targetRepo,
-    baseBranch,
-    branchName,
-    conversation,
-    startSha,
-    botName,
-    botEmail,
-    ignorePatterns: mergedPatterns,
-  });
+  appToken,
+  targetRepo,
+  baseBranch,
+  branchName,
+  conversation,
+  startSha,
+  botName,
+  botEmail,
+  authorName,
+  authorEmail,
+  ignorePatterns: mergedPatterns,
+});
   pushMs = Date.now() - pushStart;
 
   if (prUrl) {
@@ -1099,16 +1106,19 @@ async function runTool(
       };
     }
     case "git_commit": {
-      const msg = String(args.message ?? "omah: changes");
-      await asAgent("git", ["add", "-A"]);
-      const { stdout, stderr, code } = await asAgent("git", [
-        "commit",
-        "-m",
-        msg,
-      ]);
-      if (code !== 0) return { ok: false, output: stderr };
-      return { ok: true, output: stdout };
-    }
+  const msg = String(args.message ?? "omah: changes");
+  const trailer = process.env.AUTHOR_NAME && process.env.AUTHOR_EMAIL
+    ? `\n\nCo-authored-by: ${process.env.AUTHOR_NAME} <${process.env.AUTHOR_EMAIL}>`
+    : "";
+  await asAgent("git", ["add", "-A"]);
+  const { stdout, stderr, code } = await asAgent("git", [
+    "commit",
+    "-m",
+    msg + trailer,
+  ]);
+  if (code !== 0) return { ok: false, output: stderr };
+  return { ok: true, output: stdout };
+}
     default:
       return { ok: false, output: `unknown tool: ${tool}` };
   }
@@ -1311,6 +1321,8 @@ interface PushArgs {
   startSha: string;
   botName: string;
   botEmail: string;
+  authorName: string;
+  authorEmail: string;
   ignorePatterns: string[];
 }
 
@@ -1459,19 +1471,23 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
   }
 
   const commitMsg = args.conversation.summary ?? "omah: changes";
-  const commitResult = await asOrchestrator(
-    "git",
-    [
-      "-c",
-      `user.name=${args.botName}`,
-      "-c",
-      `user.email=${args.botEmail}`,
-      "commit",
-      "-m",
-      commitMsg,
-    ],
-    { cwd: pushClone },
-  );
+const trailer =
+  args.authorName && args.authorEmail
+    ? `\n\nCo-authored-by: ${args.authorName} <${args.authorEmail}>`
+    : "";
+const commitResult = await asOrchestrator(
+  "git",
+  [
+    "-c",
+    `user.name=${args.botName}`,
+    "-c",
+    `user.email=${args.botEmail}`,
+    "commit",
+    "-m",
+    commitMsg + trailer,
+  ],
+  { cwd: pushClone },
+);
   if (commitResult.code !== 0) {
     throw new Error(`commit failed: ${commitResult.stderr}`);
   }

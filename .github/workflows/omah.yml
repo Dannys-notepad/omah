@@ -157,6 +157,8 @@ jobs:
       - name: Run Omah
         id: omah
         env:
+          AUTHOR_NAME: ${{ vars.AUTHOR_NAME }}
+          AUTHOR_EMAIL: ${{ vars.AUTHOR_EMAIL }}
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_TASK: ${{ inputs.task }}
           INPUT_BASE_BRANCH: ${{ inputs.base_branch }}
