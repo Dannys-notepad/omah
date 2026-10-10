@@ -55,18 +55,18 @@ export const PROVIDERS: ProviderSpec[] = [
     model: "openai/gpt-oss-120b",
     baseURL: "https://api.groq.com/openai/v1",
   },
-  /*{
+  {
     name: "requesty",
     envVar: "REQUESTY_KEYS",
     model: "mistral/leanstral-1-5",
     baseURL: "https://router.requesty.ai/v1",
-  },*/
-  {
+  },
+  /*{
   name: "requesty",
   envVar: "REQUESTY_KEYS",
   model: "google/gemma-4-31b-it",
   baseURL: "https://router.requesty.ai/v1",
-},
+},*/
   {
   name: "poolside",
   envVar: "POOLSIDE_KEYS",
