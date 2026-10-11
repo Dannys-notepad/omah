@@ -334,7 +334,6 @@ resume.
 │       ├── omah-hostile.yml    # adversarial security test
 │       ├── omah-cleanup.yml    # daily branch cleanup
 │       └── tests.yml           # unit-test CI
-│       └── tests.yml           # unit-test CI
 ├── src/
 │   ├── llm.ts                  # provider abstraction and key loading
 │   ├── keystate.ts             # keys.json + repositories.json persistence
