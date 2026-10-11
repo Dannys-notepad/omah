@@ -128,13 +128,6 @@ you when you're close to the wall.
 
 ## Category 3 — Task submission
 
-**10. CLI wrapper.** `omah run "..."`, `omah status <id>`, `omah watch`. A
-small Node binary inside the repo, installed with `npm link`.
-
-- **Cost:** ~100 lines and a `bin` field in `package.json`.
-- **Benefit:** shorter than typing the full `gh workflow run` invocation.
-  Defaults the repo. Prints the PR URL when the run finishes.
-
 **11. Task templates.** Named, reusable prompts: "add test," "fix bug,"
 "refactor module." Pick a template, fill one or two slots, submit.
 

@@ -633,7 +633,7 @@ export async function runLoop(
       };
     }
     if (pick.kind === "wait") {
-      const remainingMs = WALL_CLOCK_MS - (Date.now() - startedAt);
+      const remainingMs = maxRuntimeMs - (Date.now() - startedAt);
       if (pick.waitMs >= remainingMs) {
         return {
           summary:

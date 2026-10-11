@@ -139,6 +139,31 @@ Actions → **Omah** → **Run workflow**.
 
 The workflow is serial: one run at a time.
 
+## CLI
+
+The CLI requires Node.js, npm, and GitHub CLI (`gh`) authenticated with access
+to the repository that hosts Omah's `omah.yml` workflow. From the Omah checkout,
+run `npm link` to install the local `omah` command. The control repo is separate
+from the target repo being changed and is stored locally; no GitHub credentials
+are written to the CLI config.
+
+```sh
+npm link
+omah config set control-repo owner/omah
+omah run --repo owner/project --task "Add retry handling and tests"
+omah run --repo owner/project --task-file task.md --provider groq
+omah resume --repo owner/project --branch omah/fix-login-a1b2c3d4 --task-file review-notes.md
+omah status
+omah status --run-id 123456789
+```
+
+Use `--control-repo owner/omah` to override the configured control repo for one
+command, or set `OMAH_CONTROL_REPO`. Task files are read from the current
+directory and support multiline prompts up to 60,000 characters. `omah status`
+shows the latest Omah workflow run, which may not be the run just dispatched;
+use `--run-id` when you know the specific ID. A successful dispatch means
+GitHub accepted the request, not necessarily that the run has started yet.
+
 ---
 
 ## The agent loop
@@ -291,6 +316,8 @@ resume.
 ```
 .
 ├── agent.ts                    # the agent loop — entry point
+├── bin/
+│   └── omah.js                 # cross-platform CLI
 ├── cleanup.ts                  # branch cleanup script
 ├── system.md                   # the system prompt
 ├── .omahignore.default         # default ignore patterns
@@ -309,6 +336,7 @@ resume.
 │   └── tool-contract.ts        # shared schemas, validation, and text fallback parser
 └── test/
     ├── agent-loop.test.ts      # loop failure-mode regression tests
+  ├── cli.test.ts             # CLI parsing and dispatch argument tests
     ├── llm-tools.test.ts       # provider request/response adapter tests
     ├── tool-contract.test.ts   # parser and schema validation tests
     ├── hostile-task.json       # scripted attack responses

@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "type": "module",
   "private": true,
+  "bin": {
+    "omah": "bin/omah.js"
+  },
   "scripts": {
     "start": "tsx agent.ts",
-    "test": "tsx --test test/agent-loop.test.ts test/llm-tools.test.ts test/tool-contract.test.ts"
+    "test": "tsx --test test/agent-loop.test.ts test/llm-tools.test.ts test/tool-contract.test.ts test/cli.test.js"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
