@@ -604,6 +604,15 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       };
     }
     if (pick.kind === "wait") {
+      const remainingMs = WALL_CLOCK_MS - (Date.now() - startedAt);
+      if (pick.waitMs >= remainingMs) {
+        return {
+          summary:
+            `LLM key cooldown exceeds the remaining wall-clock budget after ` +
+            `${args.conversation.steps.length} steps.`,
+          status: "blocked",
+        };
+      }
       await log(
         `all keys cooling; sleeping ${Math.round(pick.waitMs / 1000)}s until earliest wake`,
       );

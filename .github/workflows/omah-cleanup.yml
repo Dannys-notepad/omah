@@ -19,8 +19,9 @@ permissions:
   actions: read
 
 concurrency:
-  group: omah-cleanup
+  group: omah
   cancel-in-progress: false
+  queue: max
 
 jobs:
   cleanup:

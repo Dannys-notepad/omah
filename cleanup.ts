@@ -293,7 +293,7 @@ async function fetchPrsForBranches(
       "GET",
       `/repos/${repo}/pulls?head=${owner}:${task}&state=all&per_page=10`,
       token,
-    ).catch(() => []);
+    );
     for (const p of prs) {
       out.push({
         number: p.number,
