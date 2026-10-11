@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { createSign } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import ignore from "ignore";
 import {
   loadAllKeys,
@@ -25,6 +26,14 @@ import {
   resetTimeFor,
   type State,
 } from "./src/keystate.js";
+import {
+  parseToolCall,
+  TOOL_DEFINITIONS,
+  validateNativeToolCall,
+  type ParseToolCallResult,
+  type ToolCall,
+  type ToolName,
+} from "./src/tool-contract.js";
 
 const exec = promisify(execFile);
 
@@ -47,14 +56,6 @@ const SENTINEL_END = "<<<OMAH_END>>>";
 
 const RETRYABLE_PROVIDER_COOLDOWN_MS = 5 * 60 * 1000;
 
-const TOOL_NAMES = new Set<string>([
-  "read_file",
-  "request_write",
-  "run_bash",
-  "git_commit",
-  "finish",
-]);
-
 const OMAH_ROOT = "/tmp/omah";
 const WORKSPACE = path.join(OMAH_ROOT, "workspace");
 const SYSTEM_PROMPT_PATH = path.join(process.cwd(), "system.md");
@@ -65,13 +66,6 @@ const AGENT_HOME = `/home/${AGENT_USER}`;
 // ---------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------
-
-type ToolName =
-  | "read_file"
-  | "request_write"
-  | "run_bash"
-  | "git_commit"
-  | "finish";
 
 interface Message {
   role: "user" | "model";
@@ -154,7 +148,6 @@ interface StepUsage {
 
 const usageLog: StepUsage[] = [];
 const keyStats: Map<number, KeyStat> = new Map();
-const cooldownUntil: Map<number, number> = new Map();
 
 let persistedState: State = {
   keys: { version: 1, updated_at: new Date().toISOString(), keys: {} },
@@ -193,7 +186,11 @@ type PickResult =
   | { kind: "wait"; waitMs: number }
   | { kind: "exhausted" };
 
-function pickKey(keys: KeySpec[], start: number): PickResult {
+function pickKey(
+  keys: KeySpec[],
+  start: number,
+  cooldownUntil: Map<number, number>,
+): PickResult {
   const now = Date.now();
   for (let i = 0; i < keys.length; i++) {
     const idx = (start + i) % keys.length;
@@ -527,8 +524,40 @@ interface RunLoopResult {
   status: "done" | "blocked";
 }
 
-async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
+export interface RunLoopOptions {
+  maxRuntimeMs?: number;
+  callModel?: typeof callModel;
+}
+
+class RunBudgetExceededError extends Error {}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new RunBudgetExceededError()),
+      Math.max(0, timeoutMs),
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+export async function runLoop(
+  args: RunLoopArgs,
+  options: RunLoopOptions = {},
+): Promise<RunLoopResult> {
   const startedAt = Date.now();
+  const maxRuntimeMs = options.maxRuntimeMs ?? WALL_CLOCK_MS;
+  const invokeModel = options.callModel ?? callModel;
+  const cooldownUntil = new Map<number, number>();
   const history: Message[] = [];
   let consecutiveErrors = 0;
   let keyIndex = 0;
@@ -583,7 +612,7 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
   }
 
   while (true) {
-    if (Date.now() - startedAt > WALL_CLOCK_MS) {
+    if (Date.now() - startedAt >= maxRuntimeMs) {
       return {
         summary: `Wall-clock budget exceeded after ${args.conversation.steps.length} steps.`,
         status: "blocked",
@@ -596,7 +625,7 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       };
     }
 
-    const pick = pickKey(args.keys, keyIndex);
+    const pick = pickKey(args.keys, keyIndex, cooldownUntil);
     if (pick.kind === "exhausted") {
       return {
         summary: "All LLM keys are exhausted for the day.",
@@ -626,16 +655,37 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
 
     let responseText: string;
     let responseNote: string | undefined;
+    let responseToolCalls: ToolCall[] | undefined;
     const stepForLog = args.conversation.steps.length + 1;
+    const remainingMs = maxRuntimeMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      return {
+        summary: `Wall-clock budget exceeded after ${args.conversation.steps.length} steps.`,
+        status: "blocked",
+      };
+    }
     try {
-      const result = await callModel(
-        provider,
-        args.systemPrompt,
-        history,
-        writeState === null,
-        keyIndex,
+      const result: Awaited<ReturnType<typeof invokeModel>> = await withTimeout(
+        invokeModel(
+          provider,
+          args.systemPrompt,
+          history,
+          writeState === null,
+          keyIndex,
+        ),
+        remainingMs,
       );
       responseText = result.text;
+      responseToolCalls = result.toolCalls;
+      if (responseToolCalls?.length === 1) {
+        responseText = JSON.stringify({
+          reasoning: responseToolCalls[0].reasoning ?? "",
+          tool: responseToolCalls[0].name,
+          args: responseToolCalls[0].arguments,
+        });
+      } else if (responseToolCalls && responseToolCalls.length > 1) {
+        responseText = "[multiple native tool calls returned]";
+      }
       responseNote = result.note;
       usageLog.push({
         step: stepForLog,
@@ -653,6 +703,14 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
           (responseNote ? ` ${responseNote}` : ""),
       );
     } catch (err) {
+      if (err instanceof RunBudgetExceededError) {
+        return {
+          summary:
+            `Wall-clock budget exceeded while waiting for an LLM response ` +
+            `after ${args.conversation.steps.length} steps.`,
+          status: "blocked",
+        };
+      }
       const kind = classifyError(err);
       const errAny = err as any;
 
@@ -835,8 +893,19 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
       continue;
     }
 
-    const parsed = parseModelOutput(responseText);
-    if (!parsed) {
+    const parseResult: ParseToolCallResult = responseToolCalls
+      ? responseToolCalls.length === 1
+        ? validateNativeToolCall(responseToolCalls[0])
+        : {
+            kind: "invalid" as const,
+            message: "multiple native tool calls are unsupported; return one call",
+          }
+      : parseToolCall(responseText, keySpec.provider);
+    if (parseResult.kind !== "call") {
+      const parseError =
+        parseResult.kind === "invalid"
+          ? parseResult.message
+          : "reply with exactly one valid tool call";
       await log(`could not parse model output (${responseText.length} chars):`);
       await log(responseText.slice(0, 2000));
       consecutiveErrors += 1;
@@ -847,14 +916,23 @@ async function runLoop(args: RunLoopArgs): Promise<RunLoopResult> {
         parts: [
           {
             text:
-              "Your previous message did not contain a valid tool call. " +
-              "Respond with a single JSON object: " +
-              '{"reasoning": "...", "tool": "...", "args": {...}}',
+              `Your previous reply was invalid: ${parseError}. ` +
+              "Use exactly one declared function call. If function calling " +
+              "is unavailable, use one JSON tool envelope with a valid argument schema.",
           },
         ],
       });
       continue;
     }
+    const parsed: {
+      reasoning: string;
+      tool: ToolName;
+      args: Record<string, unknown>;
+    } = {
+      reasoning: parseResult.call.reasoning ?? "",
+      tool: parseResult.call.name as ToolName,
+      args: parseResult.call.arguments as Record<string, unknown>,
+    };
 
     const step = args.conversation.steps.length + 1;
     await log(`[step ${step}] ${parsed.tool}`);
@@ -1049,9 +1127,7 @@ function handleRawChunk(
 }
 
 function looksLikeToolCall(raw: string): boolean {
-  const parsed = parseModelOutput(raw);
-  if (!parsed) return false;
-  return TOOL_NAMES.has(parsed.tool);
+  return parseToolCall(raw, "poolside").kind !== "none";
 }
 
 async function writeAsAgentBytes(
@@ -1885,7 +1961,7 @@ async function callModel(
   history: Message[],
   jsonMode: boolean,
   keyIndex: number,
-): Promise<{ text: string; usage: UsageInfo; note?: string }> {
+): Promise<{ text: string; toolCalls?: ToolCall[]; usage: UsageInfo; note?: string }> {
   if (process.env.OMAH_SCRIPT) {
     if (scriptedResponses === null) {
       try {
@@ -1925,12 +2001,18 @@ async function callModel(
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {
       const result = await provider.complete(
-        { systemPrompt, history: llmHistory, jsonMode },
+        {
+          systemPrompt,
+          history: llmHistory,
+          jsonMode,
+          ...(jsonMode ? { tools: TOOL_DEFINITIONS } : {}),
+        },
         keyIndex,
       );
       recordKeyCall(keyIndex);
       return {
         text: result.text,
+        toolCalls: result.toolCalls,
         usage: result.usage,
         note: result.note,
       };
@@ -2054,96 +2136,6 @@ function writeRunSummary(text: string): void {
   try {
     appendFileSync(file, text + "\n");
   } catch {}
-}
-
-// ---------------------------------------------------------------
-// Model output parsing
-// ---------------------------------------------------------------
-
-interface ParsedOutput {
-  reasoning: string;
-  tool: ToolName;
-  args: Record<string, unknown>;
-}
-
-function parseModelOutput(text: string): ParsedOutput | null {
-  let raw = text.trim();
-  raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-
-  const direct = tryParse(raw);
-  if (direct) return direct;
-
-  return extractToolCall(raw);
-}
-
-function extractToolCall(text: string): ParsedOutput | null {
-  const starts: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "{") starts.push(i);
-  }
-  for (let k = starts.length - 1; k >= 0; k--) {
-    const end = matchBrace(text, starts[k]);
-    if (end === -1) continue;
-    const p = tryParse(text.slice(starts[k], end + 1));
-    if (p) return p;
-  }
-  return null;
-}
-
-function matchBrace(s: string, start: number): number {
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = start; i < s.length; i++) {
-    const c = s[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (c === "\\") esc = true;
-      else if (c === '"') inStr = false;
-      continue;
-    }
-    if (c === '"') inStr = true;
-    else if (c === "{") depth++;
-    else if (c === "}" && --depth === 0) return i;
-  }
-  return -1;
-}
-
-function tryParse(s: string): ParsedOutput | null {
-  try {
-    const obj = JSON.parse(s);
-    if (typeof obj?.tool !== "string") return null;
-
-    // Validate the tool name here, so an unknown tool produces a clean
-    // parse failure (and a retry), rather than reaching the loop.
-    if (!TOOL_NAMES.has(obj.tool)) return null;
-
-    // Standard: {"reasoning": "...", "tool": "...", "args": {...}}
-    if (typeof obj?.args === "object" && obj.args !== null) {
-      return {
-        reasoning: String(obj.reasoning ?? ""),
-        tool: obj.tool as ToolName,
-        args: obj.args as Record<string, unknown>,
-      };
-    }
-
-    // If `args` is present but not an object, the call is malformed —
-    // do not fall through to the flat branch.
-    if ("args" in obj) return null;
-
-    // Flat form: {"reasoning": "...", "tool": "...", "<param>": value}
-    // Some providers (Poolside / Laguna S) put tool parameters at the
-    // top level. Everything except `reasoning` and `tool` becomes args.
-    const { reasoning, tool, ...rest } = obj;
-    if (Object.keys(rest).length === 0) return null;
-    return {
-      reasoning: String(reasoning ?? ""),
-      tool: tool as ToolName,
-      args: rest as Record<string, unknown>,
-    };
-  } catch {
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------
@@ -2327,13 +2319,15 @@ function slugify(s: string): string {
 
 // ---------------------------------------------------------------
 
-main().catch(async (err) => {
-  console.error("[omah] fatal:", err);
-  if (metaToken && stateLoadOk && !stateSaved) {
-    stateSaved = true;
-    try {
-      await saveState(persistedState, metaToken, log);
-    } catch {}
-  }
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(async (err) => {
+    console.error("[omah] fatal:", err);
+    if (metaToken && stateLoadOk && !stateSaved) {
+      stateSaved = true;
+      try {
+        await saveState(persistedState, metaToken, log);
+      } catch {}
+    }
+    process.exit(1);
+  });
+}

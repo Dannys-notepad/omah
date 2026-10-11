@@ -1,85 +1,53 @@
 # Omah — Improvement Roadmap
 
 Every improvement discussed so far, plus the ones that fall out of the current
-design, grouped by what they'd change.
+design, grouped by what they'd change. Numbering may have gaps where completed
+items have been removed.
 
 ---
 
 ## How the agent makes a tool call (current mechanism)
 
-Before discussing improvements, the current shape — because most of the
-provider-layer work exists to fix problems in this mechanism.
+**Structured calls.** Normal turns send the same five tool declarations to
+each provider. Gemini function calls and OpenAI-compatible `tool_calls` are
+normalized to `{name, arguments}` and validated against the shared schemas in
+`src/tool-contract.ts`. Only one call is accepted per turn.
 
-**The protocol.** The model is asked to emit exactly one JSON object per turn:
+**Compatibility fallback.** If a provider explicitly rejects function-calling
+fields, its adapter retries once without tools. The model is instructed to
+return one canonical JSON envelope in that mode. Other HTTP or provider errors
+continue through normal provider rotation; they are not mistaken for tool
+support failures.
 
-```json
-{"reasoning": "…", "tool": "run_bash", "args": {"command": "ls -la"}}
-```
+**Text parsing.** Canonical JSON (optionally in a whole-response code fence) is
+accepted from any provider. Poolside alone also gets compatibility handling
+for a flat envelope, one JSON envelope inside `<tool_call>…</tool_call>`, or a
+single unambiguous envelope embedded in prose. Multiple candidates are
+rejected rather than selecting whichever appeared last. Each tool's required,
+typed arguments and allowed fields are checked before dispatch.
 
-The harness parses this, dispatches the tool, and replies with a tool result.
-The next turn carries the full history including the model's call and the
-tool's output.
+**The `request_write` exception.** File contents remain a separate raw-text
+turn. No function declarations are sent for that turn; its bytes go directly
+through the sentinel/chunk checks, and a recognizable tool envelope is
+rejected by the write guard.
 
-**The `request_write` exception.** For file writes, the model first calls
-`request_write(path)`, the harness asks for raw content, and the model's next
-message is the raw bytes of the file with a sentinel terminator
-(`<<<OMAH_END>>>`). This was added because large files broke JSON: raw newlines
-inside strings aren't valid JSON, and the model kept emitting them.
-
-**The parser.** `parseModelOutput` in `agent.ts` tries, in order:
-
-1. Strip code fences, parse the whole string as JSON.
-2. If that fails, find the last balanced `{…}` span and parse it.
-3. If that fails, try the "flat" form: `{"tool": "...", "<param>": value}`
-   where params sit at the top level instead of under `args`.
-
-The flat-form fallback was added for Poolside / Laguna S. The balanced-brace
-scan was added because reasoning text often contains a draft object before the
-real call.
-
-**The quarantine guard.** Before the raw-write path writes a file, it calls
-`looksLikeToolCall(raw)`. If the raw reply parses as a tool-call envelope, the
-write is rejected with a `TOOL_CALL_GUARD` error. This catches the case where
-the model forgets the write protocol and emits JSON instead of raw content. The
-harness pushes a placeholder into history (`[attempted JSON tool call instead
-of raw content]`) so the model doesn't reinforce its own mistake by seeing it
-repeated back.
-
-**Provider quirks absorbed so far.**
+**Provider quirks handled.**
 
 | Provider | Quirk | Where handled |
 |---|---|---|
-| Gemini | None significant | — |
-| Groq (gpt-oss) | Emits reasoning text in `message.reasoning` and leaves `content` empty | `OpenAICompatibleProvider.complete` reads `reasoning` when `content` is blank |
-| Poolside (Laguna S) | Emits XML tool calls (`<tool_call>…</tool_call>`) on first attempt, then flat JSON | Parser tries JSON, falls back to flat form |
-| Mistral (Leanstral via Requesty) | Refuses the raw-write handshake; sends JSON tool calls instead of raw content | `TOOL_CALL_GUARD` + placeholder in history |
+| Gemini | Native function-call parts need a provider-specific schema and response adapter | `GeminiProvider` |
+| OpenAI-compatible providers | Native `tool_calls`; endpoints that explicitly reject tools get one text-mode retry | `OpenAICompatibleProvider` |
+| Groq (gpt-oss) | May return useful JSON-mode text in `message.reasoning` with empty `content` | `OpenAICompatibleProvider.complete` |
+| Poolside (Laguna S) | May wrap a JSON call in `<tool_call>` or emit a flat envelope | Poolside-only fallback in `src/tool-contract.ts` |
 
-**What this costs.**
-
-- Every quirk is a code path in `agent.ts` that exists for one provider.
-- Every retry is a wasted LLM call and duplicated history.
-- The wall-clock budget absorbs the retries.
-
-This is the case for native tool calls (item 1, below). Providers have
-structured tool-calling APIs. Using them would replace the whole mechanism
-above with a schema and a structured response.
+**Tradeoff.** Native calls avoid most text parsing, but custom endpoints may
+need one fallback request. The fallback is intentionally narrow: provider
+quirks do not become global parser rules, and ambiguous output is retried rather
+than guessed.
 
 ---
 
 ## Category 1 — Provider layer
-
-**1. Native tool calls.** Each provider has a structured function-calling API:
-Gemini's `tools: [{functionDeclarations: [...]}]`, OpenAI's `tools` parameter,
-Mistral's function-calling support. Passing the tools as a schema means the
-model emits a structured call, and the SDK handles the wire format. This would
-eliminate the class of problems described above.
-
-- **Cost:** rewrite `llm.ts` and the request shape in `callModel`. The tool
-  definitions move from `system.md` prose into a TypeScript schema.
-- **Benefit:** fewer parse failures, fewer retries, cleaner code, one less
-  provider quirk to absorb per new provider.
-- **Risk:** some free-tier endpoints don't support structured tool calls at all,
-  or support them inconsistently. Requires per-provider testing.
 
 **2. Streaming responses.** Every call waits for the full reply before
 proceeding. Streaming would let the harness start reading as tokens arrive.
@@ -133,8 +101,9 @@ response, the harness could execute them together and reply once.
 
 - **Cost:** a change to the tool contract and the loop.
 - **Benefit:** fewer turns, faster runs, fewer tokens on redundant history.
-- **Prerequisite:** item 1. Structured tool calls make this easy; the
-  JSON-in-text protocol makes it hard.
+- **Prerequisite:** native calls are implemented. This item still needs a
+  batch-dispatch contract and result handling before the loop can run calls in
+  parallel.
 
 **8. Resumable runs across process death.** If the runner dies mid-task, the
 conversation state is saved but the loop restarts from scratch on resume. A
@@ -235,35 +204,25 @@ do tasks fail because of parse errors vs. provider outages?"
 - **Cost:** small. Every error path gets a code.
 - **Benefit:** data for deciding what to fix next.
 
-**20. Failure-mode tests.** The hostile test verifies the security model. A
-parallel set of tests for the agent loop: what happens when a provider hangs,
-when the model emits malformed JSON three times in a row, when the wall-clock
-budget expires.
-
-- **Cost:** cheap. The `OMAH_SCRIPT` mechanism already exists for simulating
-  specific model responses.
-- **Benefit:** confidence that the loop's error handling works, without waiting
-  for a real provider outage.
-
 ---
 
 ## Category 6 — Documentation
 
-**21. README.** Describes what Omah is, how to set it up, how to use it.
+**20. README.** Describes what Omah is, how to set it up, how to use it.
 
 - Draft written, ready to commit.
 
-**22. ARCHITECTURE.md.** The design decisions and why.
+**21. ARCHITECTURE.md.** The design decisions and why.
 
 - The master doc you wrote describes a different system. This file would
   describe the current one.
 
-**23. CHANGELOG.md.** One line per behavior-changing commit.
+**22. CHANGELOG.md.** One line per behavior-changing commit.
 
 - Reconstructing the last twenty commits would be tedious. Adding future
   entries is trivial. Start fresh.
 
-**24. Troubleshooting.md.** For when a run fails: what to check, common errors,
+**23. Troubleshooting.md.** For when a run fails: what to check, common errors,
 where the logs are.
 
 - You've accumulated enough failure modes to write this. Worth doing before
@@ -277,9 +236,8 @@ where the logs are.
    it's done when it isn't" failure mode. Path B, as decided.
 2. **History compression (6).** Directly reduces token burn. The free tiers are
    the binding constraint, and this is the single lever that moves it.
-3. **Native tool calls (1).** Eliminates the class of parser failures we've
-   been absorbing provider by provider. Biggest single-codebase change, and it
-   simplifies or unblocks several other items (7 in particular).
+3. **Provider failover mode (3).** Avoids repeatedly returning to an unhealthy
+  provider while other providers remain available.
 
-Everything else is either polish, or an addition you don't have evidence for
-yet.
+Native tool calls are implemented; the remaining ideas are deferred pending
+need or evidence.

@@ -39,6 +39,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Run tests
+        run: npm test
+
       - name: Run cleanup
         env:
           INPUT_REPO: ${{ inputs.repo }}

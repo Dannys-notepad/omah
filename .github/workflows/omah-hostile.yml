@@ -35,6 +35,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Run tests
+        run: npm test
+
       - name: Create agent user and lock down runner files
         run: |
           set -euo pipefail

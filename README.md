@@ -1,6 +1,6 @@
 # Omah
 
-**A github action based conding agent**
+**A GitHub Actions coding agent**
 
 Omah is a personal coding agent that runs on GitHub Actions, uses free-tier LLM
 keys with automatic rotation, and delivers its work as a pull request you review
@@ -26,8 +26,8 @@ GitHub Actions and free-tier infrastructure.
 - **Free.** Free Gemini, Groq, Mistral, NVIDIA, Poolside, and Requesty keys
   with rotation. Free Supabase and Hugging Face would be overkill — Omah uses
   the GitHub runner and a state branch instead.
-- **Serial.** One task at a time, by design. A review discipline more than a
-  technical limit.
+- **Serial.** Agent and cleanup workflows share a concurrency group, so only
+  one runs at a time. GitHub Actions can queue up to 100 pending runs.
 
 ## What it is not
 
@@ -47,7 +47,8 @@ Trigger → mint token → clone target → agent loop → patch → fresh clone
 ```
 
 The GitHub Actions runner is both the orchestrator and the sandbox. There is no
-separate service, no database, no queue. The workflow is the whole system.
+separate service, database, or queue service; GitHub Actions handles queued
+runs. The workflows are the whole system.
 
 1. **Trigger.** You run the `Omah` workflow with a repo and a task.
 2. **Setup.** The workflow creates an unprivileged user (`omah-runner`), runs an
@@ -56,7 +57,8 @@ separate service, no database, no queue. The workflow is the whole system.
 3. **Loop.** The agent clones the repo, calls an LLM, executes tool calls
    (`read_file`, `request_write`, `run_bash`, `git_commit`, `finish`), and
    repeats until it finishes or hits a budget.
-4. **Patch.** The agent's committed changes are captured as a binary-safe patch.
+4. **Patch.** The orchestrator stages workspace changes and captures them as a
+  binary-safe patch; an explicit agent commit is not required.
 5. **Push.** The orchestrator applies the patch to a fresh clone it controls —
    not the workspace the agent wrote to — and pushes a branch.
 6. **PR.** The orchestrator opens a pull request with a decision log.
@@ -153,22 +155,31 @@ The agent has exactly five tools.
 - **`finish(summary, status)`** — end the task. `status` is `"done"` or
   `"blocked"`.
 
-**Why a two-step write.** Content goes inside JSON strings. Long files break
-JSON when the model emits raw newlines. The `request_write` handshake sidesteps
-the problem: the model calls `request_write(path)`, the harness asks for the
-raw contents, and the model replies in plain text.
+Normal turns use provider-native function calls, normalized to one internal
+call shape and checked against per-tool argument schemas. If an endpoint
+explicitly rejects function-calling fields, its adapter retries once without
+tool declarations and accepts one canonical JSON envelope. Poolside has a
+narrow compatibility parser for its flat and JSON-wrapped `<tool_call>` forms;
+ambiguous or schema-invalid responses are rejected for a retry.
+
+**Why a two-step write.** File bytes are sent as raw text rather than escaped
+inside JSON, so long contents do not need to fit in a JSON string. The
+`request_write` handshake sends file bytes as a separate raw-text turn: the
+model requests a path, the harness asks for the contents, and the model replies
+in plain text. Function declarations are disabled for that payload turn.
 
 **Budgets.** Two, both enforced from the first step:
 - **Wall-clock:** 15 minutes.
 - **Consecutive tool errors:** 3.
 
 **Terminal states.**
-- `done` — changes committed, tests passing, PR opened as ready for review.
-- `blocked_needs_human` — the agent cannot proceed. It committed what it had
-  and opened a draft PR with an explanation. `blocked` is a first-class
-  outcome, not a failure.
-- `failed_permanent` — a budget ran out or a non-retryable error occurred.
-- `cancelled` — the user requested cancellation.
+- `done` — the task completes successfully; if it produced changes, the PR is
+  opened ready for review.
+- `blocked` — the agent cannot continue, for example after exhausting its
+  budget or available keys. If there are changes, it opens a draft PR with an
+  explanation.
+- Workflow failures before a terminal agent result are reported as failed runs;
+  GitHub cancellation is handled by the workflow runner.
 
 ---
 
@@ -183,8 +194,8 @@ The default order is:
 1. **Gemini** — 20 requests/day per key. Reliable until the cap.
 2. **Poolside** — direct API, `poolside/laguna-s-2.1`.
 3. **Requesty** — routes to multiple models, 200 requests/day per account.
-4. **Mistral** — per-account rate limit; all keys share the same bucket.
-5. **Groq** — 8,000 tokens/minute. Two or three calls before it cools.
+4. **Groq** — 8,000 tokens/minute. Two or three calls before it cools.
+5. **Mistral** — per-account rate limit; all keys share the same bucket.
 6. **NVIDIA** — often 503-overloaded. Last resort.
 
 **Key state is persisted.** When a key hits a per-day limit, Omah records it in
@@ -201,12 +212,10 @@ keys are exhausted, the run ends `blocked` with a clear summary.
 
 ## Writing files (the `request_write` protocol)
 
-The agent does not embed file contents inside JSON. Instead:
-
-1. Agent emits `{"reasoning": "...", "tool": "request_write", "args": {"path": "foo.js"}}`.
-2. Harness replies: "Reply with the raw contents."
-3. Agent emits the file's bytes as plain text, ending with `<<<OMAH_END>>>`.
-4. Harness writes the file.
+The agent calls `request_write` with a path (or uses the canonical JSON
+fallback envelope if its provider has no function-calling support). The
+harness then asks for raw contents, and the agent replies with the file bytes
+ending in `<<<OMAH_END>>>`.
 
 Large files are split across messages with `<<<OMAH_MORE>>>` between chunks.
 The harness concatenates them. Limits: 200 KB per chunk, 500 KB per file.
@@ -239,11 +248,13 @@ eventually do something unexpected.
 secrets. Omah cannot un-see what is already committed. Do not point it at
 repos with secrets in their history.
 
-**The hostile test.** Every workflow change is verified by an adversarial test
-that deliberately attempts to exfiltrate the token through git redirects,
-pre-commit hooks, `/proc` reads, and background processes. The test passes on
-the current runner image. Network egress and kernel-level attacks are out of
-scope.
+**Automated tests.** All three workflows run `npm test` before their main
+operation. The unit suite covers tool-call parsing, argument validation,
+OpenAI-compatible response normalization, and loop failure cases. The separately
+dispatched hostile workflow attempts token exfiltration through git redirects,
+pre-commit hooks, `/proc` reads, and background processes; its latest recorded
+result is in `HOSTILE-TEST-STATUS.md`. Network egress and kernel-level attacks
+remain out of scope.
 
 ---
 
@@ -284,6 +295,7 @@ resume.
 ├── system.md                   # the system prompt
 ├── .omahignore.default         # default ignore patterns
 ├── package.json
+├── package-lock.json
 ├── tsconfig.json
 ├── .github/
 │   └── workflows/
@@ -293,8 +305,12 @@ resume.
 ├── src/
 │   ├── llm.ts                  # provider abstraction and key loading
 │   ├── keystate.ts             # keys.json + repositories.json persistence
-│   └── cleanup-rules.ts        # pure decision function for cleanup
+│   ├── cleanup-rules.ts        # pure decision function for cleanup
+│   └── tool-contract.ts        # shared schemas, validation, and text fallback parser
 └── test/
+    ├── agent-loop.test.ts      # loop failure-mode regression tests
+    ├── llm-tools.test.ts       # provider request/response adapter tests
+    ├── tool-contract.test.ts   # parser and schema validation tests
     ├── hostile-task.json       # scripted attack responses
     ├── attack.sh               # pre-run setup for the hostile test
     ├── check.sh                # post-run checker
@@ -330,9 +346,6 @@ These are planned or under consideration. None are committed.
 
 - **Self-review pass.** A structured check the agent runs before `finish`.
 - **History compression.** Summarize old tool results to reduce tokens per call.
-- **Native tool calls.** Replace the JSON-in-text tool protocol with each
-  provider's structured function-calling API. Eliminates a class of parse
-  failures across providers.
 - **Comment-resume flow.** Reply to a blocked PR and the agent continues. The
   loop already supports resume; the workflow trigger is missing.
 - **CLI wrapper.** A small Node binary for submitting tasks from a terminal.

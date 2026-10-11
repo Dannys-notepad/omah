@@ -2,6 +2,7 @@
 // Provider abstraction for the Omah agent loop.
 
 import { GoogleGenAI } from "@google/genai";
+import type { ToolCall, ToolDefinition } from "./tool-contract.js";
 
 export interface LLMMessage {
   role: "user" | "assistant";
@@ -12,6 +13,7 @@ export interface LLMRequest {
   systemPrompt: string;
   history: LLMMessage[];
   jsonMode: boolean;
+  tools?: ToolDefinition[];
 }
 
 export interface UsageInfo {
@@ -24,6 +26,7 @@ export interface UsageInfo {
 
 export interface LLMResponse {
   text: string;
+  toolCalls?: ToolCall[];
   usage: UsageInfo;
   /** Optional diagnostic note from the provider (not shown to the model). */
   note?: string;
@@ -149,25 +152,66 @@ export class GeminiProvider implements LLMProvider {
   async complete(req: LLMRequest, keyIndex: number): Promise<LLMResponse> {
     const ai = new GoogleGenAI({ apiKey: this.key });
     const started = Date.now();
-    const response = await ai.models.generateContent({
+    const baseRequest: Record<string, unknown> = {
       model: this.model,
       contents: req.history.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
         parts: [{ text: m.content }],
       })),
-      config: {
-        systemInstruction: req.systemPrompt,
-        temperature: 0.2,
-        maxOutputTokens: MAX_OUTPUT_TOKENS,
-        ...(req.jsonMode ? { responseMimeType: "application/json" } : {}),
-      },
-    });
+    };
+    const config: Record<string, unknown> = {
+      systemInstruction: req.systemPrompt,
+      temperature: 0.2,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+    };
+    if (req.tools?.length) {
+      config.tools = [
+        {
+          functionDeclarations: req.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            parameters: toGeminiSchema(tool.parameters),
+          })),
+        },
+      ];
+      config.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+    } else if (req.jsonMode) {
+      config.responseMimeType = "application/json";
+    }
+
+    let response: any;
+    let note: string | undefined;
+    try {
+      response = await ai.models.generateContent({
+        ...baseRequest,
+        config,
+      } as any);
+    } catch (err) {
+      if (!req.tools?.length || !isToolCallingUnsupported(err)) throw err;
+      note = "tool calling unsupported; retried with JSON text mode";
+      response = await ai.models.generateContent({
+        ...baseRequest,
+        config: {
+          systemInstruction: req.systemPrompt,
+          temperature: 0.2,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          responseMimeType: "application/json",
+        },
+      } as any);
+    }
     const elapsed = Date.now() - started;
 
     const um: any = (response as any).usageMetadata ?? {};
     const rawText = response.text ?? "";
+    const toolCalls = Array.isArray(response.functionCalls)
+      ? response.functionCalls.map((call: any) => ({
+          name: String(call?.name ?? ""),
+          arguments: call?.args,
+        }))
+      : undefined;
     return {
       text: stripLeadingThinking(rawText),
+      ...(toolCalls?.length ? { toolCalls } : {}),
       usage: {
         input: Number(um.promptTokenCount ?? 0),
         output: Number(um.candidatesTokenCount ?? 0),
@@ -175,6 +219,7 @@ export class GeminiProvider implements LLMProvider {
         ms: elapsed,
         keyIndex,
       },
+      ...(note ? { note } : {}),
     };
   }
 }
@@ -193,20 +238,89 @@ export class OpenAICompatibleProvider implements LLMProvider {
       ...req.history.map((m) => ({ role: m.role, content: m.content })),
     ];
 
-    // Note: no response_format. Some OpenAI-compatible endpoints inject
-    // their own JSON-mode instructions into the prompt, which produces
-    // empty or malformed output with reasoning models. The parser in
-    // agent.ts strips code fences and handles plain text.
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
       temperature: 0.2,
       max_tokens: MAX_OUTPUT_TOKENS,
+      ...(req.tools?.length
+        ? {
+            tools: req.tools.map((tool) => ({
+              type: "function",
+              function: {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+                strict: true,
+              },
+            })),
+            tool_choice: "required",
+          }
+        : {}),
     };
 
-    let res: Response;
+    let res = await this.send(body);
+    let note: string | undefined;
+    if (
+      !res.ok &&
+      req.tools?.length &&
+      isToolCallingUnsupported({ status: res.status, message: await res.clone().text() })
+    ) {
+      const fallbackBody = { ...body };
+      delete fallbackBody.tools;
+      delete fallbackBody.tool_choice;
+      res = await this.send(fallbackBody);
+      note = "tool calling unsupported; retried with JSON text mode";
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw makeHttpError(res.status, text, res.headers);
+    }
+
+    const json: any = await res.json();
+    const elapsed = Date.now() - started;
+    const choice = json?.choices?.[0];
+    const message = choice?.message ?? {};
+    const finish = choice?.finish_reason;
+
+    let rawText = String(message.content ?? "");
+    if (
+      !rawText.trim() &&
+      req.jsonMode &&
+      finish !== "length" &&
+      message.reasoning
+    ) {
+      rawText = String(message.reasoning);
+    }
+
+    const toolCalls = Array.isArray(message.tool_calls)
+      ? message.tool_calls.map((call: any) => ({
+          name: String(call?.function?.name ?? ""),
+          arguments: parseToolArguments(call?.function?.arguments),
+        }))
+      : undefined;
+    const usage = json?.usage ?? {};
+
+    return {
+      text: stripLeadingThinking(rawText),
+      ...(toolCalls?.length ? { toolCalls } : {}),
+      usage: {
+        input: Number(usage.prompt_tokens ?? 0),
+        output: Number(usage.completion_tokens ?? 0),
+        thoughts: Number(
+          usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        ),
+        ms: elapsed,
+        keyIndex,
+      },
+      ...(note ? { note } : {}),
+    };
+  }
+
+  private async send(body: Record<string, unknown>): Promise<Response> {
     try {
-      res = await fetch(`${this.baseURL}/chat/completions`, {
+      return await fetch(`${this.baseURL}/chat/completions`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.key}`,
@@ -219,49 +333,40 @@ export class OpenAICompatibleProvider implements LLMProvider {
     } catch (err: any) {
       throw new Error(`fetch failed: ${err?.message ?? err}`);
     }
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw makeHttpError(res.status, text, res.headers);
-    }
-
-    const json: any = await res.json();
-const elapsed = Date.now() - started;
-const choice = json?.choices?.[0];
-const message = choice?.message ?? {};
-const finish = choice?.finish_reason;
-
-let rawText = String(message.content ?? "");
-// Some OpenAI-compatible providers (notably Groq with gpt-oss models)
-// return the useful text in `reasoning` and leave `content` empty.
-// Only use reasoning on JSON-mode turns — never on raw file writes,
-// where reasoning text would corrupt the file — and never when the
-// reply was cut off.
-if (
-  !rawText.trim() &&
-  req.jsonMode &&
-  finish !== "length" &&
-  message.reasoning
-) {
-  rawText = String(message.reasoning);
+  }
 }
 
-const usage = json?.usage ?? {};
+function toGeminiSchema(schema: ToolDefinition["parameters"]): Record<string, unknown> {
+  return {
+    type: "OBJECT",
+    properties: Object.fromEntries(
+      Object.entries(schema.properties).map(([name, property]) => [name, {
+        type: "STRING",
+        ...(property.enum ? { enum: property.enum } : {}),
+      }]),
+    ),
+    required: schema.required,
+  };
+}
 
-    return {
-      text: stripLeadingThinking(rawText),
-      usage: {
-        input: Number(usage.prompt_tokens ?? 0),
-        output: Number(usage.completion_tokens ?? 0),
-        thoughts: Number(
-          usage.completion_tokens_details?.reasoning_tokens ?? 0,
-        ),
-        ms: elapsed,
-        keyIndex,
-      },
-      //note,
-    };
+function parseToolArguments(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
   }
+}
+
+function isToolCallingUnsupported(error: unknown): boolean {
+  const value = error as any;
+  const status = Number(value?.status ?? value?.response?.status);
+  return (
+    [400, 404, 422].includes(status) &&
+    /tool|function|unsupported|not supported/i.test(
+      String(value?.message ?? value?.error?.message ?? ""),
+    )
+  );
 }
 
 export function makeProvider(spec: KeySpec): LLMProvider {

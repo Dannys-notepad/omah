@@ -49,30 +49,35 @@ Note: turn 2 is not JSON. It is the file's actual contents.
 
 ## Output format
 
-For every message that is not a raw file write, respond with exactly one JSON
-object and nothing else:
+For a normal tool turn, call exactly one declared function and do not emit a
+second call in the same response. If the provider does not offer function
+calling, respond with exactly one JSON tool envelope and nothing else:
 
 {"reasoning": "1-2 sentences on what you're doing and why", "tool": "<name>", "args": {...}}
 
-Args for each tool:
+For JSON fallback envelopes only, use these arguments:
 - read_file: {"path"}
 - request_write: {"path"}
 - run_bash: {"command"}
 - git_commit: {"message"}
 - finish: {"summary", "status"}
 
-Every tool call must have exactly three fields: `reasoning`, `tool`, and
-`args`. The tool's parameters go inside `args`, never at the top level.
+Every JSON fallback envelope must have exactly three fields: `reasoning`,
+`tool`, and `args`. The tool's parameters go inside `args`, never at the top
+level.
 
-Correct:   {"reasoning": "Listing files.", "tool": "run_bash", "args": {"command": "ls -la"}}
-Incorrect: {"reasoning": "Listing files.", "tool": "run_bash", "command": "ls -la"}
+Correct fallback:   {"reasoning": "Listing files.", "tool": "run_bash", "args": {"command": "ls -la"}}
+Incorrect fallback: {"reasoning": "Listing files.", "tool": "run_bash", "command": "ls -la"}
 
 Do not use XML-style tool calls. Do not emit `<tool_call>`, `<arg_key>`, or
 `<arg_value>` tags. Use only the JSON object form. If you are about to emit an
 XML tag, emit the equivalent JSON object instead.
 
-Put your thinking in the `reasoning` field. The user reads it. Do not emit any
-text outside the JSON object.
+In a JSON fallback envelope, put a brief explanation in the `reasoning` field.
+Do not put prose around the envelope. Function-call arguments must match the
+declared argument schema exactly; do not add fields or omit required values.
+When the harness asks for raw file contents, ignore the tool-call format for
+that turn and send only the requested bytes and sentinel.
 
 When the arguments contain quotes, backslashes, or newlines, escape them as
 JSON requires: newlines become `\n`, double quotes become `\"`, backslashes
