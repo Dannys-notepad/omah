@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runLoop } from "../agent.js";
+import {
+  handleRawChunk,
+  rawWriteRetryInstruction,
+  runLoop,
+} from "../agent.js";
 
 function createArgs() {
   return {
@@ -53,6 +57,24 @@ test("blocks after three malformed model replies", async () => {
   assert.equal(calls, 3);
   assert.equal(result.status, "blocked");
   assert.match(result.summary, /3 consecutive tool errors/);
+  assert.match(result.summary, /invalid model call from gemini/);
+});
+
+test("diagnoses malformed Poolside tool markup in raw-write replies", () => {
+  const raw = '{"reasoning":"","tool":"run_bash<arg_key>command</arg_key><arg_value>pnpm test</arg_value></tool_call>}';
+  const outcome = handleRawChunk(
+    raw,
+    { path: "src/lib/core/createProject.js", chunks: [], bytesTotal: 0 },
+    "src/lib/core/createProject.js",
+  );
+
+  assert.equal(outcome.kind, "error");
+  assert.equal(outcome.code, "MISSING_SENTINEL");
+  assert.match(outcome.message, /malformed tool-call markup/);
+  assert.match(
+    rawWriteRetryInstruction("src/lib/core/createProject.js", "MISSING_SENTINEL", "poolside"),
+    /Do not emit <tool_call>, <arg_key>, <arg_value>/,
+  );
 });
 
 test("dispatches one normalized native tool call", async () => {
@@ -90,6 +112,50 @@ test("blocks when a provider cooldown exceeds the remaining budget", async () =>
   assert.equal(calls, 1);
   assert.equal(result.status, "blocked");
   assert.match(result.summary, /cooldown exceeds the remaining wall-clock budget/);
+});
+
+test("cools every key when their provider quota bucket is configured as shared", async () => {
+  const args = createArgs();
+  args.keys.push({ ...args.keys[0], key: "second-key" });
+  let calls = 0;
+  const rateLimit = Object.assign(new Error("rate limit exceeded"), {
+    status: 429,
+    retryAfterMs: 30_000,
+  });
+  const result = await runLoop(args, {
+    maxRuntimeMs: 1_000,
+    sharedQuotaProviders: ["gemini"],
+    callModel: async () => {
+      calls += 1;
+      throw rateLimit;
+    },
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.status, "blocked");
+  assert.match(result.summary, /cooldown exceeds the remaining wall-clock budget/);
+});
+
+test("continues rotating keys when provider quotas are not configured as shared", async () => {
+  const args = createArgs();
+  args.keys.push({ ...args.keys[0], key: "second-key" });
+  let calls = 0;
+  const rateLimit = Object.assign(new Error("rate limit exceeded"), {
+    status: 429,
+    retryAfterMs: 30_000,
+  });
+  const result = await runLoop(args, {
+    maxRuntimeMs: 10_000,
+    sharedQuotaProviders: [],
+    callModel: async () => {
+      calls += 1;
+      if (calls === 1) throw rateLimit;
+      return modelResponse('{"tool":"finish","args":{"summary":"ok","status":"done"}}');
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(result, { summary: "ok", status: "done" });
 });
 
 test("blocks when a provider never responds within the run budget", async () => {

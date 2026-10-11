@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OpenAICompatibleProvider } from "../src/llm.js";
+import {
+  normalizeGeminiResponse,
+  OpenAICompatibleProvider,
+} from "../src/llm.js";
 import { TOOL_DEFINITIONS } from "../src/tool-contract.js";
 
 const provider = new OpenAICompatibleProvider(
@@ -8,6 +11,22 @@ const provider = new OpenAICompatibleProvider(
   "test-model",
   "test-key",
 );
+
+test("prefers Gemini function calls without reading the text getter", () => {
+  const response: Record<string, unknown> = {
+    functionCalls: [{ name: "read_file", args: { path: "README.md" } }],
+  };
+  Object.defineProperty(response, "text", {
+    get() {
+      throw new Error("text getter should not be read for function calls");
+    },
+  });
+
+  assert.deepEqual(normalizeGeminiResponse(response), {
+    text: "",
+    toolCalls: [{ name: "read_file", arguments: { path: "README.md" } }],
+  });
+});
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

@@ -168,6 +168,7 @@ jobs:
           INPUT_RESUME_TEXT: ${{ inputs.resume_text }}
           INPUT_PROVIDER: ${{ inputs.provider }}
           OMAH_DISABLED_PROVIDERS: ${{ vars.OMAH_DISABLED_PROVIDERS }}
+          OMAH_SHARED_QUOTA_PROVIDERS: ${{ vars.OMAH_SHARED_QUOTA_PROVIDERS }}
           OMAH_META_REPO: ${{ vars.OMAH_META_REPO }}
           GROQ_KEYS: ${{ secrets.GROQ_KEYS }}
           GEMINI_KEYS: ${{ secrets.GEMINI_KEYS }}

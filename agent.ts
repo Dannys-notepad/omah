@@ -527,6 +527,7 @@ interface RunLoopResult {
 export interface RunLoopOptions {
   maxRuntimeMs?: number;
   callModel?: typeof callModel;
+  sharedQuotaProviders?: string[];
 }
 
 class RunBudgetExceededError extends Error {}
@@ -558,8 +559,15 @@ export async function runLoop(
   const maxRuntimeMs = options.maxRuntimeMs ?? WALL_CLOCK_MS;
   const invokeModel = options.callModel ?? callModel;
   const cooldownUntil = new Map<number, number>();
+  const sharedQuotaProviders = new Set(
+    (options.sharedQuotaProviders ?? process.env.OMAH_SHARED_QUOTA_PROVIDERS ?? "")
+      .split(",")
+      .map((provider) => provider.trim().toLowerCase())
+      .filter(Boolean),
+  );
   const history: Message[] = [];
   let consecutiveErrors = 0;
+  let lastFailure = "";
   let keyIndex = 0;
 
   let writeState: WriteState | null = null;
@@ -620,7 +628,9 @@ export async function runLoop(
     }
     if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
       return {
-        summary: `Stopped after ${MAX_CONSECUTIVE_ERRORS} consecutive tool errors.`,
+        summary:
+          `Stopped after ${MAX_CONSECUTIVE_ERRORS} consecutive tool errors.` +
+          (lastFailure ? ` Last failure: ${lastFailure}` : ""),
         status: "blocked",
       };
     }
@@ -716,24 +726,40 @@ export async function runLoop(
 
       if (kind === "quota") {
         const ks = args.keys[keyIndex];
-        const fp = fingerprint(ks.provider, ks.key);
+        const sharedBucket = sharedQuotaProviders.has(ks.provider.toLowerCase());
+        const affectedKeys = sharedBucket
+          ? args.keys.flatMap((key, index) =>
+              key.provider === ks.provider ? [index] : [],
+            )
+          : [keyIndex];
 
         if (isPerDayLimit(err)) {
-          cooldownUntil.set(keyIndex, Number.POSITIVE_INFINITY);
-          persistedState.keys.keys[fp] = {
-            status: "exhausted",
-            reason: "PerDay",
-            reset_at: resetTimeFor(err, ks.provider),
-            last_seen: new Date().toISOString(),
-          };
+          for (const affectedKey of affectedKeys) {
+            const affectedSpec = args.keys[affectedKey];
+            const fp = fingerprint(affectedSpec.provider, affectedSpec.key);
+            cooldownUntil.set(affectedKey, Number.POSITIVE_INFINITY);
+            persistedState.keys.keys[fp] = {
+              status: "exhausted",
+              reason: "PerDay",
+              reset_at: resetTimeFor(err, affectedSpec.provider),
+              last_seen: new Date().toISOString(),
+            };
+          }
           await log(
-            `key ${keyIndex + 1} (${ks.provider}) per-day exhausted; persisted`,
+            sharedBucket
+              ? `provider ${ks.provider} shared per-day quota exhausted across ${affectedKeys.length} keys; persisted`
+              : `key ${keyIndex + 1} (${ks.provider}) per-day exhausted; persisted`,
           );
         } else {
           const wait = Number(errAny?.retryAfterMs ?? 60_000);
-          cooldownUntil.set(keyIndex, Date.now() + wait);
+          const cooldown = Date.now() + wait;
+          for (const affectedKey of affectedKeys) {
+            cooldownUntil.set(affectedKey, cooldown);
+          }
           await log(
-            `key ${keyIndex + 1} (${ks.provider}) cooling ${Math.round(wait / 1000)}s (per-minute)`,
+            sharedBucket
+              ? `provider ${ks.provider} shared quota cooling ${affectedKeys.length} keys for ${Math.round(wait / 1000)}s`
+              : `key ${keyIndex + 1} (${ks.provider}) cooling ${Math.round(wait / 1000)}s (per-minute)`,
           );
         }
 
@@ -790,6 +816,7 @@ export async function runLoop(
       const outcome = handleRawChunk(responseText, writeState, writeState.path);
 
       if (outcome.kind === "error") {
+        lastFailure = `${writeState.path} (${outcome.code}): ${outcome.message}`;
         if (outcome.code === "TOOL_CALL_GUARD") {
           await log(
             `guard: rejected raw write for ${writeState.path} ` +
@@ -804,7 +831,17 @@ export async function runLoop(
         });
         history.push({
           role: "user",
-          parts: [{ text: `Tool result (error):\n${outcome.message}` }],
+          parts: [
+            {
+              text:
+                `Tool result (error):\n${outcome.message}\n\n` +
+                rawWriteRetryInstruction(
+                  writeState.path,
+                  outcome.code,
+                  keySpec.provider,
+                ),
+            },
+          ],
         });
         args.conversation.steps.push({
           step: args.conversation.steps.length + 1,
@@ -885,8 +922,14 @@ export async function runLoop(
         ],
       });
 
-      if (writeResult.ok) consecutiveErrors = 0;
-      else consecutiveErrors += 1;
+      if (writeResult.ok) {
+        consecutiveErrors = 0;
+        lastFailure = "";
+      }
+      else {
+        consecutiveErrors += 1;
+        lastFailure = `${writeState.path}: ${writeResult.output}`;
+      }
 
       writeState = null;
       await saveConversation(args.conversation, args.targetRepo, args.appToken);
@@ -906,6 +949,7 @@ export async function runLoop(
         parseResult.kind === "invalid"
           ? parseResult.message
           : "reply with exactly one valid tool call";
+          lastFailure = `invalid model call from ${keySpec.provider}: ${parseError}`;
       await log(`could not parse model output (${responseText.length} chars):`);
       await log(responseText.slice(0, 2000));
       consecutiveErrors += 1;
@@ -960,6 +1004,7 @@ export async function runLoop(
       const p = String(parsed.args.path ?? "");
       if (!p) {
         consecutiveErrors += 1;
+        lastFailure = "request_write: missing path";
         history.push({ role: "model", parts: [{ text: responseText }] });
         history.push({
           role: "user",
@@ -979,6 +1024,7 @@ export async function runLoop(
       } catch (err: any) {
         const msg = String(err?.message ?? err);
         consecutiveErrors += 1;
+        lastFailure = `request_write ${p}: ${msg}`;
         history.push({ role: "model", parts: [{ text: responseText }] });
         history.push({
           role: "user",
@@ -1048,8 +1094,14 @@ export async function runLoop(
       ],
     });
 
-    if (result.ok) consecutiveErrors = 0;
-    else consecutiveErrors += 1;
+    if (result.ok) {
+      consecutiveErrors = 0;
+      lastFailure = "";
+    }
+    else {
+      consecutiveErrors += 1;
+      lastFailure = `${parsed.tool}: ${truncate(result.output, 300)}`;
+    }
 
     await saveConversation(args.conversation, args.targetRepo, args.appToken);
   }
@@ -1059,7 +1111,7 @@ export async function runLoop(
 // Raw-write chunk handling
 // ---------------------------------------------------------------
 
-function handleRawChunk(
+export function handleRawChunk(
   raw: string,
   state: WriteState,
   filePath: string,
@@ -1082,13 +1134,16 @@ function handleRawChunk(
   if (last === SENTINEL_MORE) {
     isMore = true;
   } else if (last !== SENTINEL_END) {
+    const containsToolMarkup = /<\/?tool_call\b|<arg_key\b|<arg_value\b/i.test(raw);
     return {
       kind: "error",
       code: "MISSING_SENTINEL",
       message:
-        `Missing ${SENTINEL_END} line, nothing was written ` +
-        `(the reply may have been cut off). Call request_write again ` +
-        `and send the file in chunks of ~250 lines.`,
+        containsToolMarkup
+          ? `Raw response for ${filePath} contained malformed tool-call markup instead of file contents. Nothing was written; missing ${SENTINEL_END}.`
+          : `Missing ${SENTINEL_END} line, nothing was written ` +
+            `(the reply may have been cut off). Call request_write again ` +
+            `and send the file in chunks of ~250 lines.`,
     };
   }
   lines.pop();
@@ -1128,6 +1183,28 @@ function handleRawChunk(
 
 function looksLikeToolCall(raw: string): boolean {
   return parseToolCall(raw, "poolside").kind !== "none";
+}
+
+export function rawWriteRetryInstruction(
+  filePath: string,
+  code: ChunkErrorCode,
+  provider: string,
+): string {
+  if (code === "FILE_TOO_LARGE") {
+    return `The file ${JSON.stringify(filePath)} exceeds the write limit. Stop and finish as blocked; do not retry this file.`;
+  }
+  if (code === "CHUNK_TOO_LARGE") {
+    return `The chunk for ${JSON.stringify(filePath)} exceeded 200 KB. Call request_write again and split the file into smaller chunks, ending non-final chunks with ${SENTINEL_MORE}.`;
+  }
+
+  const providerRule = provider === "poolside"
+    ? "Do not emit <tool_call>, <arg_key>, <arg_value>, JSON, XML, or shell commands in the raw payload."
+    : "Do not emit another tool call, JSON envelope, or explanation in the raw payload.";
+  return (
+    `The raw write for ${JSON.stringify(filePath)} was rejected (${code}); no bytes were written. ` +
+    `Call request_write again for the same path. When asked for contents, send only the file bytes, ` +
+    `then end with a line containing exactly ${SENTINEL_END}. ${providerRule}`
+  );
 }
 
 async function writeAsAgentBytes(

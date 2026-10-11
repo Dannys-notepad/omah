@@ -240,6 +240,25 @@ in temporary runner storage when the repository has no browser tooling.
 
 ---
 
+## Observed run follow-ups
+
+**Zorx run `a85c4ba2` (2026-10-11).** The run stopped after 28 steps and
+three consecutive raw-write failures on `src/lib/core/createProject.js`.
+Items 1 and 2 from the task landed; item 3 was not attempted.
+
+| Observation | Follow-up |
+|---|---|
+| Poolside returned a malformed JSON/XML tool-call hybrid instead of raw source and omitted `<<<OMAH_END>>>`; the harness correctly wrote nothing. | Raw-write errors now identify tool-call markup, and retry instructions explicitly require a fresh `request_write` followed by bytes only. Unit coverage reproduces the malformed shape. Validate against a real Poolside run. |
+| Gemini's five keys all hit `GenerateRequestsPerMinutePerProjectPerModel-FreeTier` at five requests/minute. | `OMAH_SHARED_QUOTA_PROVIDERS` can cool all keys for a configured shared provider bucket. The log does not prove whether the keys belong to one project; configure `gemini` only if they share that quota. |
+| Gemini emitted native function calls, while the SDK's `.text` getter warned and discarded the non-text parts. | Gemini calls are extracted before reading `.text`; a regression test ensures the getter is not touched when calls exist. |
+| The blocked PR title only said there were three consecutive tool errors. | The loop now appends the last failing provider/tool/path and error to that stop summary. |
+
+The Poolside retry change is still a hypothesis about improving model behavior;
+the regression test verifies diagnosis and instruction construction, not that a
+live model will follow the instruction.
+
+---
+
 ## What I would rank as the top three
 
 1. **Self-review pass (5).** Small, high value, addresses the "agent believes

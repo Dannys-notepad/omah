@@ -146,6 +146,20 @@ export function loadAllKeys(
 const MAX_OUTPUT_TOKENS = 16384;
 const FETCH_TIMEOUT_MS = 120_000;
 
+export function normalizeGeminiResponse(response: any): {
+  text: string;
+  toolCalls?: ToolCall[];
+} {
+  const toolCalls = Array.isArray(response.functionCalls)
+    ? response.functionCalls.map((call: any) => ({
+        name: String(call?.name ?? ""),
+        arguments: call?.args,
+      }))
+    : [];
+  if (toolCalls.length > 0) return { text: "", toolCalls };
+  return { text: stripLeadingThinking(response.text ?? "") };
+}
+
 export class GeminiProvider implements LLMProvider {
   constructor(private key: string, private model: string) {}
 
@@ -202,16 +216,10 @@ export class GeminiProvider implements LLMProvider {
     const elapsed = Date.now() - started;
 
     const um: any = (response as any).usageMetadata ?? {};
-    const rawText = response.text ?? "";
-    const toolCalls = Array.isArray(response.functionCalls)
-      ? response.functionCalls.map((call: any) => ({
-          name: String(call?.name ?? ""),
-          arguments: call?.args,
-        }))
-      : undefined;
+    const normalized = normalizeGeminiResponse(response);
     return {
-      text: stripLeadingThinking(rawText),
-      ...(toolCalls?.length ? { toolCalls } : {}),
+      text: normalized.text,
+      ...(normalized.toolCalls ? { toolCalls: normalized.toolCalls } : {}),
       usage: {
         input: Number(um.promptTokenCount ?? 0),
         output: Number(um.candidatesTokenCount ?? 0),

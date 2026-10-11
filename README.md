@@ -112,6 +112,7 @@ Same page, **Variables** tab.
 | `OMAH_META_REPO` | `owner/omah` — for state persistence | Yes |
 | `OMAH_ALLOWED_REPOS` | Comma-separated allowlist | No |
 | `OMAH_DISABLED_PROVIDERS` | Comma-separated providers to skip | No |
+| `OMAH_SHARED_QUOTA_PROVIDERS` | Providers whose API keys share one quota bucket, e.g. `gemini` | No |
 | `OMAH_CLEANUP_DRY_RUN` | `true` to dry-run cleanup | No |
 | `AUTHOR_NAME` | Git author name for commits | No |
 | `AUTHOR_EMAIL` | Git author email (verified on GitHub) | No |

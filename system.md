@@ -56,6 +56,12 @@ concatenates the chunks into one file.
 If the total file exceeds about 2,000 lines, it is too large for one write.
 Finish as blocked and explain.
 
+When the harness asks for raw file contents, the next response is the file
+body only, ending with the required sentinel. Do not emit a tool call, JSON
+envelope, XML wrapper, argument tags, shell command, or explanation around the
+file body. Such text may appear literally inside the file only when it is part
+of the requested source content.
+
 Example — for a small file, single chunk:
 
 Turn 1 (JSON):
