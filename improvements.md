@@ -4,6 +4,10 @@ Every improvement discussed so far, plus the ones that fall out of the current
 design, grouped by what they'd change. Numbering may have gaps where completed
 items have been removed.
 
+The unit suite now runs in a dedicated CI workflow on pushes to `main` and pull
+requests. Operational workflows do not repeat it; the hostile security test
+remains a separate manual workflow.
+
 ---
 
 ## How the agent makes a tool call (current mechanism)
@@ -201,10 +205,6 @@ do tasks fail because of parse errors vs. provider outages?"
 
 ## Category 6 — Documentation
 
-**20. README.** Describes what Omah is, how to set it up, how to use it.
-
-- Draft written, ready to commit.
-
 **21. ARCHITECTURE.md.** The design decisions and why.
 
 - The master doc you wrote describes a different system. This file would
@@ -220,6 +220,23 @@ where the logs are.
 
 - You've accumulated enough failure modes to write this. Worth doing before
   you forget them.
+
+---
+
+## Category 7 — Frontend verification
+
+**24. Conditional browser smoke tests.** For frontend tasks that need browser
+verification, use the target repository's existing Playwright or Cypress setup
+first. An explicit opt-in could provision a pinned Playwright/Chromium version
+in temporary runner storage when the repository has no browser tooling.
+
+- **Cost:** browser downloads add startup time and network/supply-chain surface.
+- **Benefit:** catch route failures, console errors, broken interactions, and
+  responsive layout issues beyond what unit tests reveal.
+- **Constraint:** Omah currently receives text tool output, not images. Browser
+  checks can report DOM/accessibility and console results; screenshots should
+  be saved as workflow artifacts for human review. Do not claim visual
+  verification when no browser run occurred.
 
 ---
 

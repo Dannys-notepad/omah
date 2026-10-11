@@ -17,6 +17,9 @@ target repo. You review the diff. You merge, or you don't. Omah never merges.
 A single TypeScript agent plus a small set of workflows, running entirely on
 GitHub Actions and free-tier infrastructure.
 
+- **JS/TS-first, full-stack.** Omah focuses on JavaScript and TypeScript across
+  Node.js backends, browser frontends, and shared packages, following the
+  target repository's existing framework and conventions.
 - **Asynchronous.** Submit a task and walk away. Check on it later.
 - **Cloud-hosted.** Every operation happens on a GitHub-hosted runner. Your
   devices only submit and read.
@@ -273,13 +276,13 @@ eventually do something unexpected.
 secrets. Omah cannot un-see what is already committed. Do not point it at
 repos with secrets in their history.
 
-**Automated tests.** All three workflows run `npm test` before their main
-operation. The unit suite covers tool-call parsing, argument validation,
-OpenAI-compatible response normalization, and loop failure cases. The separately
-dispatched hostile workflow attempts token exfiltration through git redirects,
-pre-commit hooks, `/proc` reads, and background processes; its latest recorded
-result is in `HOSTILE-TEST-STATUS.md`. Network egress and kernel-level attacks
-remain out of scope.
+**Automated tests.** The dedicated test workflow runs `npm test` on pull
+requests and pushes to `main`. The suite covers tool-call parsing, argument
+validation, OpenAI-compatible response normalization, and loop failure cases.
+The separately dispatched hostile workflow tests runner isolation and token
+exfiltration defenses; its latest recorded result is in
+`HOSTILE-TEST-STATUS.md`. Network egress and kernel-level attacks remain out of
+scope.
 
 ---
 
@@ -328,7 +331,9 @@ resume.
 │   └── workflows/
 │       ├── omah.yml            # production workflow
 │       ├── omah-hostile.yml    # adversarial security test
-│       └── omah-cleanup.yml    # daily branch cleanup
+│       ├── omah-cleanup.yml    # daily branch cleanup
+│       └── tests.yml           # unit-test CI
+│       └── tests.yml           # unit-test CI
 ├── src/
 │   ├── llm.ts                  # provider abstraction and key loading
 │   ├── keystate.ts             # keys.json + repositories.json persistence
@@ -336,7 +341,7 @@ resume.
 │   └── tool-contract.ts        # shared schemas, validation, and text fallback parser
 └── test/
     ├── agent-loop.test.ts      # loop failure-mode regression tests
-  ├── cli.test.ts             # CLI parsing and dispatch argument tests
+  ├── cli.test.js             # CLI parsing and dispatch argument tests
     ├── llm-tools.test.ts       # provider request/response adapter tests
     ├── tool-contract.test.ts   # parser and schema validation tests
     ├── hostile-task.json       # scripted attack responses
@@ -374,9 +379,10 @@ These are planned or under consideration. None are committed.
 
 - **Self-review pass.** A structured check the agent runs before `finish`.
 - **History compression.** Summarize old tool results to reduce tokens per call.
+- **Conditional frontend browser checks.** Use existing browser tooling, with
+  optional pinned Playwright provisioning when a task explicitly needs it.
 - **Comment-resume flow.** Reply to a blocked PR and the agent continues. The
   loop already supports resume; the workflow trigger is missing.
-- **CLI wrapper.** A small Node binary for submitting tasks from a terminal.
 - **Scheduled tasks.** Recurring prompts, e.g. weekly dependency upgrades.
 
 ---
