@@ -58,7 +58,7 @@ const MAX_FILE_BYTES = 500 * 1024;
 const SENTINEL_MORE = "<<<OMAH_MORE>>>";
 const SENTINEL_END = "<<<OMAH_END>>>";
 
-const RETRYABLE_PROVIDER_COOLDOWN_MS = 5 * 60 * 1000;
+const RETRYABLE_KEY_COOLDOWN_MS = 30 * 1000;
 
 const OMAH_ROOT = "/tmp/omah";
 const WORKSPACE = path.join(OMAH_ROOT, "workspace");
@@ -780,11 +780,11 @@ const sharedQuotaProviders = new Set(
     // Best-effort history compression. Never touches consecutiveErrors
     // and never blocks the run. Skipped during the raw-write handshake.
     if (!writeState) {
-      const stepsSince =
-        args.conversation.steps.length - lastCompressAtStepCount;
-      if (stepsSince >= MIN_STEPS_BETWEEN && compressionsDone < 3) {
-        try {
-          const compressed = compressHistory(
+  const stepsSince =
+    args.conversation.steps.length - lastCompressAtStepCount;
+  if (compressionsDone < 3) {
+    try {
+      const compressed = compressHistory(
             history,
             args.conversation.steps,
             { startSha: args.startSha },
@@ -939,21 +939,17 @@ const sharedQuotaProviders = new Set(
       }
 
       if (kind === "retryable") {
-        const bad = args.keys[keyIndex].provider;
-        for (let i = 0; i < args.keys.length; i++) {
-          if (args.keys[i].provider === bad) {
-            cooldownUntil.set(
-              i,
-              Date.now() + RETRYABLE_PROVIDER_COOLDOWN_MS,
-            );
-          }
-        }
-        await log(
-          `provider ${bad} cooling ${Math.round(RETRYABLE_PROVIDER_COOLDOWN_MS / 1000)}s after retryable error`,
-        );
-        keyIndex = (keyIndex + 1) % args.keys.length;
-        continue;
-      }
+  const bad = args.keys[keyIndex].provider;
+  cooldownUntil.set(
+    keyIndex,
+    Date.now() + RETRYABLE_KEY_COOLDOWN_MS,
+  );
+  await log(
+    `key ${keyIndex + 1} (${bad}) cooling ${Math.round(RETRYABLE_KEY_COOLDOWN_MS / 1000)}s after retryable error`,
+  );
+  keyIndex = (keyIndex + 1) % args.keys.length;
+  continue;
+}
 
       if (kind === "rotate") {
         const bad = args.keys[keyIndex].provider;

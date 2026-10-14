@@ -89,7 +89,7 @@ export const RECENT_KEEP = 5;
 export const MIN_STEPS_BETWEEN = 6;
 
 /** Estimated-token floor below which compression is skipped. */
-export const MIN_ESTIMATED_TOKENS = 6000;
+export const MIN_ESTIMATED_TOKENS = 4000;
 
 /** Hard cap on compression passes per task. */
 export const MAX_COMPRESSIONS = 3;
@@ -157,14 +157,12 @@ export function compressHistory(
   if (state.compressionsDone >= MAX_COMPRESSIONS) {
     return { history, didCompress: false };
   }
-  if (state.stepsSinceLastCompress < MIN_STEPS_BETWEEN) {
-    return { history, didCompress: false };
-  }
-
   const estimated = estimateTokens(history, context.charsPerToken);
-  if (estimated < MIN_ESTIMATED_TOKENS) {
-    return { history, didCompress: false };
-  }
+const stepsGateMet = state.stepsSinceLastCompress >= MIN_STEPS_BETWEEN;
+const sizeGateMet = estimated >= MIN_ESTIMATED_TOKENS;
+if (!stepsGateMet && !sizeGateMet) {
+  return { history, didCompress: false };
+}
 
   const cutoff = history.length - RECENT_KEEP;
   if (cutoff <= 1) {
