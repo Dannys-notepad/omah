@@ -38,6 +38,21 @@ import {
   compressHistory,
   MIN_STEPS_BETWEEN,
 } from "./src/history.js";
+import {
+  buildFixRoundMessage,
+  buildReviewPrompt,
+  filesFromDiff,
+  formatIssuesTable,
+  harnessIssuesFromTests,
+  hasActionableIssue,
+  mergeIssues,
+  parseReviewResponse,
+  pickTestCommand,
+  readTestScript,
+  reviewConcernsStatusLine,
+  truncateDiff,
+  type ReviewIssue,
+} from "./src/review.js";
 
 const exec = promisify(execFile);
 
@@ -78,6 +93,16 @@ const TEST_SUMMARY_PATTERN = /\b\d+\s+(passed|failed|suites?|tests?)\b/i;
 const KEY_LINES_MAX = 15;
 const KEY_LINE_CHARS = 200;
 
+const REVIEW_MAX_DIFF_BYTES = 30 * 1024;
+const REVIEW_MAX_FILE_DIFF_BYTES = 10 * 1024;
+const REVIEW_TEST_TIMEOUT_MS = 3 * 60 * 1000;
+const REVIEW_MIN_REMAINING_MS = 4 * 60 * 1000;
+const REVIEW_FIX_BUDGET_MS = 4 * 60 * 1000;
+const REVIEW_MAX_CALLS = 3;
+
+const REVIEWER_SYSTEM_PROMPT =
+  "You review code changes produced by another agent. Reply with strict JSON only.";
+
 // ---------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------
@@ -98,17 +123,11 @@ export interface ConversationStep {
     ok: boolean;
     output: string;
     truncated?: boolean;
-    /** Real byte size of the output, before truncation. */
     outputBytes?: number;
-    /** Real line count of the output, before truncation. */
     outputLines?: number;
-    /** Exit code from run_bash, when known. */
     exitCode?: number;
-    /** Up to KEY_LINES_MAX digested interesting lines. */
     keyLines?: string[];
-    /** Total matches before the cap, so the stub can say "+N more". */
     keyLinesTotal?: number;
-    /** Final test summary line, when a test command produced one. */
     testSummary?: string;
   };
   at: string;
@@ -126,6 +145,10 @@ export interface Conversation {
   summary?: string;
   status?: "done" | "blocked";
   startedAt: string;
+  /** Set when the review gate found actionable issues. */
+  reviewConcerns?: boolean;
+  /** The issues the reviewer and the harness raised. */
+  reviewIssues?: ReviewIssue[];
 }
 
 interface ExecResult {
@@ -184,6 +207,23 @@ interface StepUsage {
   tool: string;
 }
 
+interface ReviewGateArgs {
+  conversation: Conversation;
+  startSha: string;
+  appToken: string;
+  keys: KeySpec[];
+  targetRepo: string;
+  branchName: string;
+  runStartedAt: number;
+}
+
+interface ReviewGateOutcome {
+  ran: boolean;
+  reenter: boolean;
+  fixMessage: string;
+  issues: ReviewIssue[];
+}
+
 // ---------------------------------------------------------------
 // Usage tracking
 // ---------------------------------------------------------------
@@ -198,6 +238,7 @@ let persistedState: State = {
 let metaToken = "";
 let stateLoadOk = false;
 let stateSaved = false;
+let lastUsedProvider: string | null = null;
 
 function recordKeyCall(keyIndex: number): void {
   const s = keyStats.get(keyIndex) ?? { calls: 0, rate429: 0, errors: 0 };
@@ -376,7 +417,6 @@ async function main(): Promise<void> {
     );
   }
 
-  // Record this target repo in the state (persisted at save time).
   if (addRepo(persistedState, targetRepo)) {
     await log(`keystate: new target repo "${targetRepo}" will be recorded`);
   }
@@ -512,6 +552,50 @@ async function main(): Promise<void> {
 
   await saveConversation(conversation, targetRepo, appToken);
 
+  // ---------------------------------------------------------------
+  // Review gate (only on status=done)
+  // ---------------------------------------------------------------
+  if (result.status === "done" && !conversation.reviewConcerns) {
+    const outcome = await runReviewGate({
+      conversation,
+      startSha,
+      appToken,
+      keys,
+      targetRepo,
+      branchName,
+      runStartedAt: runStarted,
+    });
+    if (outcome.ran && outcome.issues.length > 0) {
+      conversation.reviewIssues = outcome.issues;
+    }
+    if (outcome.reenter) {
+      await log("[review] re-entering loop for fix round");
+      conversation.reviewConcerns = true;
+      await saveConversation(conversation, targetRepo, appToken);
+      const fixResult = await runLoop(
+        {
+          systemPrompt,
+          task: conversation.taskText,
+          resumeText: outcome.fixMessage,
+          conversation,
+          keys,
+          targetRepo,
+          branchName,
+          appToken,
+          startSha,
+        },
+        { maxRuntimeMs: REVIEW_FIX_BUDGET_MS },
+      );
+      result = fixResult;
+      conversation.summary = fixResult.summary;
+      conversation.status = fixResult.status;
+      await saveConversation(conversation, targetRepo, appToken);
+    } else if (outcome.ran && hasActionableIssue(outcome.issues)) {
+      conversation.reviewConcerns = true;
+      await saveConversation(conversation, targetRepo, appToken);
+    }
+  }
+
   if (process.env.OMAH_SCRIPT) {
     try {
       await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
@@ -530,6 +614,7 @@ async function main(): Promise<void> {
     authorName,
     authorEmail,
     ignorePatterns: mergedPatterns,
+    reviewConcerns: Boolean(conversation.reviewConcerns),
   });
   pushMs = Date.now() - pushStart;
 
@@ -539,6 +624,231 @@ async function main(): Promise<void> {
   setOutput("status", result.status);
 
   await log(`done. pr=${prUrl || "(none)"} status=${result.status}`);
+}
+
+// ---------------------------------------------------------------
+// Review gate
+// ---------------------------------------------------------------
+
+async function runReviewGate(
+  args: ReviewGateArgs,
+): Promise<ReviewGateOutcome> {
+  const skip = async (reason: string): Promise<ReviewGateOutcome> => {
+    await log(`[review] skipped: ${reason}`);
+    return { ran: false, reenter: false, fixMessage: "", issues: [] };
+  };
+
+  const remaining = WALL_CLOCK_MS - (Date.now() - args.runStartedAt);
+  if (remaining < REVIEW_MIN_REMAINING_MS) {
+    return skip(`only ${Math.round(remaining / 1000)}s left`);
+  }
+  if (args.keys.length === 0) return skip("no keys available");
+
+  // 1. Snapshot git status before the fresh test run.
+  const beforePaths = await listChangedPaths();
+
+  // 2. Pick the test command.
+  const pkg = await readPackageJson();
+  const testScript = readTestScript(pkg);
+  const command = pickTestCommand(
+    args.conversation.steps.map((s) => ({ tool: s.tool, args: s.args })),
+    testScript,
+  );
+
+  // 3. Run tests, or report none.
+  let testExitCode: number | null = null;
+  let testTimedOut = false;
+  let testSummary: string | null = null;
+  let testKeyLines: string[] = [];
+  const hadTests = command !== null;
+
+  if (hadTests && command) {
+    await log(`[review] running tests: ${command}`);
+    const result = await runBashWithDetach(command, REVIEW_TEST_TIMEOUT_MS);
+    testExitCode = result.code;
+    testTimedOut = result.code === 124;
+    if (!testTimedOut) {
+      const output = `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+      const digest = buildBashDigest(output, result.code);
+      testSummary = digest.testSummary ?? null;
+      testKeyLines = digest.keyLines ?? [];
+    }
+    await log(
+      `[review] test exit=${testExitCode} timedOut=${testTimedOut} ` +
+        `keyLines=${testKeyLines.length}`,
+    );
+  } else {
+    await log("[review] no test command; skipping test run");
+  }
+
+  // 4. Revert test side effects (only paths new since the snapshot).
+  await revertNewChanges(beforePaths);
+
+  // 5. Build the diff and file list.
+  const diffResult = await asAgentBuffer("git", [
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    args.startSha,
+    "--",
+  ]);
+  if (diffResult.code !== 0) {
+    return skip(`diff failed: ${diffResult.stderr.slice(0, 120)}`);
+  }
+  const rawDiff = diffResult.stdout.toString("utf8");
+  const filtered = rawDiff
+    .split(/^(?=diff --git )/m)
+    .filter((chunk) => !chunk.startsWith("diff --git a/.git/"))
+    .join("");
+  const diff = truncateDiff(
+    filtered,
+    REVIEW_MAX_FILE_DIFF_BYTES,
+    REVIEW_MAX_DIFF_BYTES,
+  );
+  const fileList = filesFromDiff(diff);
+
+  if (diff.trim().length === 0) {
+    return skip("empty diff");
+  }
+
+  // 6. Build the prompt.
+  const prompt = buildReviewPrompt({
+    task: args.conversation.taskText,
+    diff,
+    fileList,
+    testSummary,
+    testKeyLines,
+    testExitCode,
+    testTimedOut,
+    hadTests,
+    sameProviderAsWriter: false,
+  });
+
+  // 7. Call the reviewer, rotating through keys.
+  const call = await callReviewerWithRotation(args.keys, prompt);
+  if (!call) return skip("reviewer call failed on all attempted keys");
+  const sameProviderAsWriter =
+    lastUsedProvider !== null && call.provider === lastUsedProvider;
+  if (sameProviderAsWriter) {
+    await log(
+      `[review] warning: reviewed by same provider as writer (${call.provider})`,
+    );
+  }
+
+  // 8. Parse the verdict.
+  const verdict = parseReviewResponse(call.text);
+  if (!verdict) {
+    await log("[review] could not parse reviewer response; skipping");
+    return skip("could not parse reviewer response");
+  }
+
+  // 9. Merge with harness-owned issues.
+  const harnessIssues = harnessIssuesFromTests({
+    hadTests,
+    testTimedOut,
+    testExitCode,
+  });
+  const merged = mergeIssues(verdict.issues, harnessIssues);
+
+  await log(
+    `[review] verdict=${verdict.verdict} issues=${merged.length} ` +
+      `actionable=${hasActionableIssue(merged)}`,
+  );
+
+  if (!hasActionableIssue(merged)) {
+    return { ran: true, reenter: false, fixMessage: "", issues: merged };
+  }
+
+  // 10. Check we can afford the fix round.
+  const remainingForFix = WALL_CLOCK_MS - (Date.now() - args.runStartedAt);
+  if (remainingForFix < REVIEW_MIN_REMAINING_MS) {
+    await log(
+      `[review] concerns found, but only ${Math.round(remainingForFix / 1000)}s left; ` +
+        `opening as draft without a fix round`,
+    );
+    return { ran: true, reenter: false, fixMessage: "", issues: merged };
+  }
+
+  return {
+    ran: true,
+    reenter: true,
+    fixMessage: buildFixRoundMessage(merged),
+    issues: merged,
+  };
+}
+
+async function callReviewerWithRotation(
+  keys: KeySpec[],
+  prompt: string,
+): Promise<{ text: string; provider: string } | null> {
+  // Prefer a provider different from the writer's last one.
+  const ordered = lastUsedProvider
+    ? [
+        ...keys.filter((k) => k.provider !== lastUsedProvider),
+        ...keys.filter((k) => k.provider === lastUsedProvider),
+      ]
+    : keys;
+
+  const attempts = Math.min(ordered.length, REVIEW_MAX_CALLS);
+  for (let i = 0; i < attempts; i++) {
+    const spec = ordered[i];
+    try {
+      const provider = makeProvider(spec);
+      const response = await provider.complete(
+        {
+          systemPrompt: REVIEWER_SYSTEM_PROMPT,
+          history: [{ role: "user", content: prompt }],
+          jsonMode: true,
+        },
+        i,
+      );
+      await log(`[review] called ${spec.provider}`);
+      return { text: response.text, provider: spec.provider };
+    } catch (err: any) {
+      const kind = classifyError(err);
+      await log(
+        `[review] key ${i + 1} (${spec.provider}) failed: ${kind} ` +
+          `${String(err?.message ?? err).slice(0, 100)}`,
+      );
+      continue;
+    }
+  }
+  return null;
+}
+
+async function listChangedPaths(): Promise<Set<string>> {
+  const { stdout } = await asAgent("git", ["status", "--porcelain"]);
+  const paths = new Set<string>();
+  for (const line of stdout.split("\n")) {
+    if (line.length < 4) continue;
+    const p = line.slice(3).trim();
+    if (p) paths.add(p);
+  }
+  return paths;
+}
+
+async function revertNewChanges(before: Set<string>): Promise<void> {
+  const after = await listChangedPaths();
+  const reverted: string[] = [];
+  for (const p of after) {
+    if (before.has(p)) continue;
+    await asAgent("git", ["checkout", "--", p]).catch(() => {});
+    await asAgent("rm", ["-f", p]).catch(() => {});
+    reverted.push(p);
+  }
+  if (reverted.length > 0) {
+    await log(`[review] reverted ${reverted.length} test side-effect path(s)`);
+  }
+}
+
+async function readPackageJson(): Promise<unknown> {
+  try {
+    const { stdout, code } = await asAgent("cat", ["package.json"]);
+    if (code !== 0) return null;
+    return JSON.parse(stdout);
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------
@@ -589,10 +899,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-/**
- * Push a step record and return its number. Computing sizes and digests
- * here, once, keeps the recording logic in one place.
- */
 function recordStep(
   conversation: Conversation,
   entry: Omit<ConversationStep, "step" | "at"> & { at?: string },
@@ -626,18 +932,14 @@ function recordStep(
   return stepNumber;
 }
 
-/**
- * Strip ANSI escape codes and normalise line endings for digesting.
- */
 function cleanOutput(s: string): string {
   return s.replace(/\r\n/g, "\n").replace(ANSI_PATTERN, "");
 }
 
-/**
- * Build the digest fields for a run_bash result from the full output,
- * before any truncation happens.
- */
-function buildBashDigest(fullOutput: string, exitCode: number): {
+function buildBashDigest(
+  fullOutput: string,
+  exitCode: number,
+): {
   exitCode: number;
   keyLines?: string[];
   keyLinesTotal?: number;
@@ -661,7 +963,6 @@ function buildBashDigest(fullOutput: string, exitCode: number): {
 
   const keyLinesTotal = matched.length;
   const keyLines = matched.slice(0, KEY_LINES_MAX);
-
   const testSummary = lines.find((l) => TEST_SUMMARY_PATTERN.test(l))?.trim();
 
   const digest: {
@@ -689,24 +990,22 @@ export async function runLoop(
   const invokeModel = options.callModel ?? callModel;
   const cooldownUntil = new Map<number, number>();
   const sharedQuotaInput =
-  options.sharedQuotaProviders ??
-  process.env.OMAH_SHARED_QUOTA_PROVIDERS ??
-  "";
-const sharedQuotaList = Array.isArray(sharedQuotaInput)
-  ? sharedQuotaInput
-  : String(sharedQuotaInput).split(",");
-const sharedQuotaProviders = new Set(
-  sharedQuotaList
-    .map((provider) => provider.trim().toLowerCase())
-    .filter(Boolean),
-);
+    options.sharedQuotaProviders ??
+    process.env.OMAH_SHARED_QUOTA_PROVIDERS ??
+    "";
+  const sharedQuotaList = Array.isArray(sharedQuotaInput)
+    ? sharedQuotaInput
+    : String(sharedQuotaInput).split(",");
+  const sharedQuotaProviders = new Set(
+    sharedQuotaList
+      .map((provider) => provider.trim().toLowerCase())
+      .filter(Boolean),
+  );
   const history: Message[] = [];
   let consecutiveErrors = 0;
   let lastFailure = "";
   let keyIndex = 0;
 
-  // Compression state. On resume, back-date so the first pass can run
-  // immediately if history is already long.
   let lastCompressAtStepCount =
     args.conversation.steps.length > 0 ? -MIN_STEPS_BETWEEN : 0;
   let compressionsDone = 0;
@@ -777,14 +1076,12 @@ const sharedQuotaProviders = new Set(
       };
     }
 
-    // Best-effort history compression. Never touches consecutiveErrors
-    // and never blocks the run. Skipped during the raw-write handshake.
     if (!writeState) {
-  const stepsSince =
-    args.conversation.steps.length - lastCompressAtStepCount;
-  if (compressionsDone < 3) {
-    try {
-      const compressed = compressHistory(
+      const stepsSince =
+        args.conversation.steps.length - lastCompressAtStepCount;
+      if (compressionsDone < 3) {
+        try {
+          const compressed = compressHistory(
             history,
             args.conversation.steps,
             { startSha: args.startSha },
@@ -939,17 +1236,17 @@ const sharedQuotaProviders = new Set(
       }
 
       if (kind === "retryable") {
-  const bad = args.keys[keyIndex].provider;
-  cooldownUntil.set(
-    keyIndex,
-    Date.now() + RETRYABLE_KEY_COOLDOWN_MS,
-  );
-  await log(
-    `key ${keyIndex + 1} (${bad}) cooling ${Math.round(RETRYABLE_KEY_COOLDOWN_MS / 1000)}s after retryable error`,
-  );
-  keyIndex = (keyIndex + 1) % args.keys.length;
-  continue;
-}
+        const bad = args.keys[keyIndex].provider;
+        cooldownUntil.set(
+          keyIndex,
+          Date.now() + RETRYABLE_KEY_COOLDOWN_MS,
+        );
+        await log(
+          `key ${keyIndex + 1} (${bad}) cooling ${Math.round(RETRYABLE_KEY_COOLDOWN_MS / 1000)}s after retryable error`,
+        );
+        keyIndex = (keyIndex + 1) % args.keys.length;
+        continue;
+      }
 
       if (kind === "rotate") {
         const bad = args.keys[keyIndex].provider;
@@ -1479,6 +1776,7 @@ function formatBashOutput(result: {
 
 async function runBashWithDetach(
   cmd: string,
+  timeoutMs: number = 5 * 60 * 1000,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
     const child = spawn(
@@ -1513,7 +1811,7 @@ async function runBashWithDetach(
       child.kill("SIGKILL");
       await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
       done(124);
-    }, 5 * 60 * 1000);
+    }, timeoutMs);
 
     child.stdout.on("data", (d: Buffer) => {
       if (stdout.length < MAX_BASH_OUT) stdout += d.toString();
@@ -1675,6 +1973,7 @@ interface PushArgs {
   authorName: string;
   authorEmail: string;
   ignorePatterns: string[];
+  reviewConcerns: boolean;
 }
 
 async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
@@ -1856,6 +2155,9 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
     `/repos/${owner}/${repo}/pulls?head=${owner}:${args.branchName}&state=open`,
   );
 
+  const shouldBeDraft =
+    args.conversation.status === "blocked" || args.reviewConcerns;
+
   let prUrl: string;
   let prNodeId: string | null = null;
   let prIsDraft = false;
@@ -1865,24 +2167,29 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
     prNodeId = pr.node_id;
     prIsDraft = Boolean(pr.draft);
     await client("PATCH", `/repos/${owner}/${repo}/pulls/${pr.number}`, {
-      title: titleFor(args.conversation),
-      body: bodyFor(args.conversation),
+      title: titleFor(args.conversation, args.reviewConcerns),
+      body: bodyFor(args.conversation, args.reviewConcerns),
     });
     prUrl = pr.html_url;
   } else {
     const created: any = await client("POST", `/repos/${owner}/${repo}/pulls`, {
-      title: titleFor(args.conversation),
+      title: titleFor(args.conversation, args.reviewConcerns),
       head: args.branchName,
       base: args.baseBranch,
-      body: bodyFor(args.conversation),
-      draft: args.conversation.status === "blocked",
+      body: bodyFor(args.conversation, args.reviewConcerns),
+      draft: shouldBeDraft,
     });
     prUrl = created.html_url;
     prNodeId = created.node_id;
     prIsDraft = Boolean(created.draft);
   }
 
-  if (args.conversation.status === "done" && prNodeId && prIsDraft) {
+  if (
+    args.conversation.status === "done" &&
+    !args.reviewConcerns &&
+    prNodeId &&
+    prIsDraft
+  ) {
     await markReadyForReview(args.appToken, prNodeId);
   }
 
@@ -2028,11 +2335,15 @@ async function writeStepSummary(
   return "";
 }
 
-function titleFor(c: Conversation): string {
-  const title =
-    c.status === "blocked"
-      ? `[Omah] Blocked: ${c.summary ?? "needs input"}`
-      : `[Omah] ${c.summary ?? "changes"}`;
+function titleFor(c: Conversation, reviewConcerns: boolean): string {
+  let title: string;
+  if (reviewConcerns) {
+    title = `[Omah] Review concerns: ${c.summary ?? "needs review"}`;
+  } else if (c.status === "blocked") {
+    title = `[Omah] Blocked: ${c.summary ?? "needs input"}`;
+  } else {
+    title = `[Omah] ${c.summary ?? "changes"}`;
+  }
   return title.slice(0, 250);
 }
 
@@ -2040,7 +2351,7 @@ function sanitize(s: string): string {
   return s.replace(/```/g, "`\u200B``").replace(/@/g, "@\u200B");
 }
 
-function bodyFor(c: Conversation): string {
+function bodyFor(c: Conversation, reviewConcerns: boolean): string {
   const MAX_STEPS = 200;
   const stepsToShow = c.steps.slice(0, MAX_STEPS);
   const omitted = c.steps.length - stepsToShow.length;
@@ -2056,28 +2367,44 @@ function bodyFor(c: Conversation): string {
 
   const omittedLine = omitted > 0 ? `\n\n… ${omitted} more steps omitted.` : "";
 
-  const body = [
-    `## Task`,
-    ``,
-    `> ${sanitize(c.taskText)}`,
-    ``,
-    `## Summary`,
-    ``,
-    sanitize(c.summary ?? "(none)"),
-    ``,
-    `## Decision log`,
-    ``,
-    `<details>`,
-    `<summary>${c.steps.length} steps</summary>`,
-    ``,
-    "```",
-    stepLines.join("\n\n") + omittedLine,
-    "```",
-    `</details>`,
-    ``,
-    `---`,
-    `_Generated by Omah._`,
-  ].join("\n");
+  const sections: string[] = [];
+
+  if (reviewConcerns) {
+    const issues = c.reviewIssues ?? [];
+    const statusLine = reviewConcernsStatusLine({
+      fixRoundAttempted: c.reviewConcerns === true,
+      issues,
+    });
+    sections.push(statusLine);
+    sections.push("");
+    sections.push("## Review findings");
+    sections.push("");
+    sections.push(formatIssuesTable(issues));
+    sections.push("");
+  }
+
+  sections.push("## Task");
+  sections.push("");
+  sections.push(`> ${sanitize(c.taskText)}`);
+  sections.push("");
+  sections.push("## Summary");
+  sections.push("");
+  sections.push(sanitize(c.summary ?? "(none)"));
+  sections.push("");
+  sections.push("## Decision log");
+  sections.push("");
+  sections.push("<details>");
+  sections.push(`<summary>${c.steps.length} steps</summary>`);
+  sections.push("");
+  sections.push("```");
+  sections.push(stepLines.join("\n\n") + omittedLine);
+  sections.push("```");
+  sections.push("</details>");
+  sections.push("");
+  sections.push("---");
+  sections.push("_Generated by Omah._");
+
+  const body = sections.join("\n");
 
   if (body.length > MAX_PR_BODY_CHARS) {
     return (
@@ -2273,6 +2600,9 @@ async function callModel(
         keyIndex,
       );
       recordKeyCall(keyIndex);
+      lastUsedProvider = provider.constructor.name === "GeminiProvider"
+        ? "gemini"
+        : null;
       return {
         text: result.text,
         toolCalls: result.toolCalls,
