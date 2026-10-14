@@ -5,26 +5,27 @@ import {
   rawWriteRetryInstruction,
   runLoop,
 } from "../agent.js";
+import type { ConversationStep, RunLoopArgs } from "../agent.js";
 
-function createArgs() {
+function createArgs(): RunLoopArgs {
   return {
     systemPrompt: "test prompt",
     task: "test task",
     resumeText: "",
     conversation: {
-      version: 1 as const,
+      version: 1,
       taskId: "test",
       taskText: "test task",
       targetRepo: "owner/repo",
       baseBranch: "main",
       branchName: "omah/test-12345678",
-      steps: [],
+      steps: [] as ConversationStep[],
       finished: false,
       startedAt: new Date().toISOString(),
     },
     keys: [
       {
-        provider: "gemini" as const,
+        provider: "gemini",
         model: "test-model",
         baseURL: null,
         key: "test-key",

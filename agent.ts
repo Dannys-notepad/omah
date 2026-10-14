@@ -34,6 +34,10 @@ import {
   type ToolCall,
   type ToolName,
 } from "./src/tool-contract.js";
+import {
+  compressHistory,
+  MIN_STEPS_BETWEEN,
+} from "./src/history.js";
 
 const exec = promisify(execFile);
 
@@ -63,6 +67,17 @@ const IGNORE_FILE_PATH = path.join(process.cwd(), ".omahignore.default");
 const AGENT_USER = "omah-runner";
 const AGENT_HOME = `/home/${AGENT_USER}`;
 
+const BASH_HEAD_CHARS = 1_500;
+const BASH_TAIL_CHARS = 2_500;
+
+const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
+const KEY_LINE_PATTERN =
+  /fail|error|✗|✕|FAIL|Cannot find|TypeError|ReferenceError|SyntaxError|AssertionError/i;
+const ZERO_LINE_PATTERN = /\b0\s+(failed|errors?)\b|no errors?/i;
+const TEST_SUMMARY_PATTERN = /\b\d+\s+(passed|failed|suites?|tests?)\b/i;
+const KEY_LINES_MAX = 15;
+const KEY_LINE_CHARS = 200;
+
 // ---------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------
@@ -70,18 +85,36 @@ const AGENT_HOME = `/home/${AGENT_USER}`;
 interface Message {
   role: "user" | "model";
   parts: Array<{ text: string }>;
+  /** Step number this message pairs with. Set on tool-result pushes only. */
+  step?: number;
 }
 
-interface ConversationStep {
+export interface ConversationStep {
   step: number;
   reasoning: string;
   tool: ToolName;
   args: Record<string, unknown>;
-  result: { ok: boolean; output: string; truncated?: boolean };
+  result: {
+    ok: boolean;
+    output: string;
+    truncated?: boolean;
+    /** Real byte size of the output, before truncation. */
+    outputBytes?: number;
+    /** Real line count of the output, before truncation. */
+    outputLines?: number;
+    /** Exit code from run_bash, when known. */
+    exitCode?: number;
+    /** Up to KEY_LINES_MAX digested interesting lines. */
+    keyLines?: string[];
+    /** Total matches before the cap, so the stub can say "+N more". */
+    keyLinesTotal?: number;
+    /** Final test summary line, when a test command produced one. */
+    testSummary?: string;
+  };
   at: string;
 }
 
-interface Conversation {
+export interface Conversation {
   version: 1;
   taskId: string;
   taskText: string;
@@ -99,6 +132,15 @@ interface ExecResult {
   stdout: string;
   stderr: string;
   code: number;
+}
+
+interface ToolResult {
+  ok: boolean;
+  output: string;
+  exitCode?: number;
+  keyLines?: string[];
+  keyLinesTotal?: number;
+  testSummary?: string;
 }
 
 interface WriteState {
@@ -339,13 +381,11 @@ async function main(): Promise<void> {
     await log(`keystate: new target repo "${targetRepo}" will be recorded`);
   }
 
-  const { botId, appSlug } = await resolveAppIdentity(appJwt);
-  
-  const botName = `${appSlug}[bot]`;
-  const botEmail = `${botId}+${appSlug}[bot]@users.noreply.github.com`;
+  const { appSlug } = await resolveAppIdentity(appJwt);
 
-const authorName = process.env.AUTHOR_NAME || botName;
-const authorEmail = process.env.AUTHOR_EMAIL || botEmail;
+  const authorName = process.env.AUTHOR_NAME || appSlug;
+  const authorEmail =
+    process.env.AUTHOR_EMAIL || `${appSlug}[bot]@users.noreply.github.com`;
 
   const client = githubClient(appToken);
   const repoInfo = await getRepo(client, targetRepo);
@@ -481,18 +521,16 @@ const authorEmail = process.env.AUTHOR_EMAIL || botEmail;
 
   const pushStart = Date.now();
   const prUrl = await pushPatchAndOpenPR({
-  appToken,
-  targetRepo,
-  baseBranch,
-  branchName,
-  conversation,
-  startSha,
-  botName,
-  botEmail,
-  authorName,
-  authorEmail,
-  ignorePatterns: mergedPatterns,
-});
+    appToken,
+    targetRepo,
+    baseBranch,
+    branchName,
+    conversation,
+    startSha,
+    authorName,
+    authorEmail,
+    ignorePatterns: mergedPatterns,
+  });
   pushMs = Date.now() - pushStart;
 
   if (prUrl) {
@@ -507,7 +545,7 @@ const authorEmail = process.env.AUTHOR_EMAIL || botEmail;
 // The loop
 // ---------------------------------------------------------------
 
-interface RunLoopArgs {
+export interface RunLoopArgs {
   systemPrompt: string;
   task: string;
   resumeText: string;
@@ -551,6 +589,97 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+/**
+ * Push a step record and return its number. Computing sizes and digests
+ * here, once, keeps the recording logic in one place.
+ */
+function recordStep(
+  conversation: Conversation,
+  entry: Omit<ConversationStep, "step" | "at"> & { at?: string },
+  digest?: Pick<
+    ToolResult,
+    "exitCode" | "keyLines" | "keyLinesTotal" | "testSummary"
+  >,
+  measure = false,
+): number {
+  const stepNumber = conversation.steps.length + 1;
+  const record: ConversationStep = {
+    ...entry,
+    step: stepNumber,
+    at: entry.at ?? new Date().toISOString(),
+  };
+  if (measure) {
+    record.result.outputBytes = Buffer.byteLength(entry.result.output, "utf8");
+    record.result.outputLines = entry.result.output.split("\n").length;
+  }
+  if (digest) {
+    if (digest.exitCode !== undefined) record.result.exitCode = digest.exitCode;
+    if (digest.keyLines && digest.keyLines.length > 0) {
+      record.result.keyLines = digest.keyLines;
+    }
+    if (digest.keyLinesTotal !== undefined) {
+      record.result.keyLinesTotal = digest.keyLinesTotal;
+    }
+    if (digest.testSummary) record.result.testSummary = digest.testSummary;
+  }
+  conversation.steps.push(record);
+  return stepNumber;
+}
+
+/**
+ * Strip ANSI escape codes and normalise line endings for digesting.
+ */
+function cleanOutput(s: string): string {
+  return s.replace(/\r\n/g, "\n").replace(ANSI_PATTERN, "");
+}
+
+/**
+ * Build the digest fields for a run_bash result from the full output,
+ * before any truncation happens.
+ */
+function buildBashDigest(fullOutput: string, exitCode: number): {
+  exitCode: number;
+  keyLines?: string[];
+  keyLinesTotal?: number;
+  testSummary?: string;
+} {
+  const cleaned = cleanOutput(fullOutput);
+  const lines = cleaned.split("\n");
+
+  const matched: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (!KEY_LINE_PATTERN.test(line)) continue;
+    if (ZERO_LINE_PATTERN.test(line)) continue;
+    const cut = line.slice(0, KEY_LINE_CHARS);
+    if (seen.has(cut)) continue;
+    seen.add(cut);
+    matched.push(cut);
+  }
+
+  const keyLinesTotal = matched.length;
+  const keyLines = matched.slice(0, KEY_LINES_MAX);
+
+  const testSummary = lines.find((l) => TEST_SUMMARY_PATTERN.test(l))?.trim();
+
+  const digest: {
+    exitCode: number;
+    keyLines?: string[];
+    keyLinesTotal?: number;
+    testSummary?: string;
+  } = { exitCode };
+
+  if (keyLines.length > 0) {
+    digest.keyLines = keyLines;
+    digest.keyLinesTotal = keyLinesTotal;
+  }
+  if (testSummary) digest.testSummary = testSummary.slice(0, KEY_LINE_CHARS);
+
+  return digest;
+}
+
 export async function runLoop(
   args: RunLoopArgs,
   options: RunLoopOptions = {},
@@ -559,16 +688,28 @@ export async function runLoop(
   const maxRuntimeMs = options.maxRuntimeMs ?? WALL_CLOCK_MS;
   const invokeModel = options.callModel ?? callModel;
   const cooldownUntil = new Map<number, number>();
-  const sharedQuotaProviders = new Set(
-    (options.sharedQuotaProviders ?? process.env.OMAH_SHARED_QUOTA_PROVIDERS ?? "")
-      .split(",")
-      .map((provider) => provider.trim().toLowerCase())
-      .filter(Boolean),
-  );
+  const sharedQuotaInput =
+  options.sharedQuotaProviders ??
+  process.env.OMAH_SHARED_QUOTA_PROVIDERS ??
+  "";
+const sharedQuotaList = Array.isArray(sharedQuotaInput)
+  ? sharedQuotaInput
+  : String(sharedQuotaInput).split(",");
+const sharedQuotaProviders = new Set(
+  sharedQuotaList
+    .map((provider) => provider.trim().toLowerCase())
+    .filter(Boolean),
+);
   const history: Message[] = [];
   let consecutiveErrors = 0;
   let lastFailure = "";
   let keyIndex = 0;
+
+  // Compression state. On resume, back-date so the first pass can run
+  // immediately if history is already long.
+  let lastCompressAtStepCount =
+    args.conversation.steps.length > 0 ? -MIN_STEPS_BETWEEN : 0;
+  let compressionsDone = 0;
 
   let writeState: WriteState | null = null;
   let pendingWriteReasoning = "";
@@ -594,6 +735,7 @@ export async function runLoop(
       });
       history.push({
         role: "user",
+        step: step.step,
         parts: [
           {
             text: `Tool result (${step.result.ok ? "ok" : "error"}):\n${step.result.output}`,
@@ -633,6 +775,35 @@ export async function runLoop(
           (lastFailure ? ` Last failure: ${lastFailure}` : ""),
         status: "blocked",
       };
+    }
+
+    // Best-effort history compression. Never touches consecutiveErrors
+    // and never blocks the run. Skipped during the raw-write handshake.
+    if (!writeState) {
+      const stepsSince =
+        args.conversation.steps.length - lastCompressAtStepCount;
+      if (stepsSince >= MIN_STEPS_BETWEEN && compressionsDone < 3) {
+        try {
+          const compressed = compressHistory(
+            history,
+            args.conversation.steps,
+            { startSha: args.startSha },
+            { stepsSinceLastCompress: stepsSince, compressionsDone },
+          );
+          if (compressed.didCompress) {
+            lastCompressAtStepCount = args.conversation.steps.length;
+            compressionsDone += 1;
+            await log(
+              `[compress] pass ${compressionsDone} applied ` +
+                `(step ${args.conversation.steps.length}, ${history.length} msgs)`,
+            );
+          }
+        } catch (err: any) {
+          await log(
+            `[compress] skipped: ${String(err?.message ?? err).slice(0, 200)}`,
+          );
+        }
+      }
     }
 
     const pick = pickKey(args.keys, keyIndex, cooldownUntil);
@@ -829,8 +1000,10 @@ export async function runLoop(
           role: "model",
           parts: [{ text: "[attempted JSON tool call instead of raw content]" }],
         });
+        const writeErrorStep = args.conversation.steps.length + 1;
         history.push({
           role: "user",
+          step: writeErrorStep,
           parts: [
             {
               text:
@@ -843,8 +1016,7 @@ export async function runLoop(
             },
           ],
         });
-        args.conversation.steps.push({
-          step: args.conversation.steps.length + 1,
+        recordStep(args.conversation, {
           reasoning: pendingWriteReasoning,
           tool: "request_write",
           args: { path: pendingWritePath },
@@ -852,7 +1024,6 @@ export async function runLoop(
             ok: false,
             output: `[${outcome.code}] ${outcome.message}`,
           },
-          at: new Date().toISOString(),
         });
         writeState = null;
         consecutiveErrors += 1;
@@ -893,8 +1064,23 @@ export async function runLoop(
         );
       }
 
-      args.conversation.steps.push({
+      history.push({
+        role: "model",
+        parts: [{ text: `[raw file content for ${writeState.path}]` }],
+      });
+      history.push({
+        role: "user",
         step: stepNo,
+        parts: [
+          {
+            text: writeResult.ok
+              ? `Tool result (ok): wrote ${writeState.path} (${contents.length} bytes)`
+              : `Tool result (error): ${writeResult.output}`,
+          },
+        ],
+      });
+
+      recordStep(args.conversation, {
         reasoning: pendingWriteReasoning,
         tool: "request_write",
         args: { path: writeState.path },
@@ -904,22 +1090,6 @@ export async function runLoop(
             ? `wrote ${writeState.path} (${contents.length} bytes)`
             : writeResult.output,
         },
-        at: new Date().toISOString(),
-      });
-
-      history.push({
-        role: "model",
-        parts: [{ text: `[raw file content for ${writeState.path}]` }],
-      });
-      history.push({
-        role: "user",
-        parts: [
-          {
-            text: writeResult.ok
-              ? `Tool result (ok): wrote ${writeState.path} (${contents.length} bytes)`
-              : `Tool result (error): ${writeResult.output}`,
-          },
-        ],
       });
 
       if (writeResult.ok) {
@@ -989,13 +1159,11 @@ export async function runLoop(
     if (parsed.tool === "finish") {
       const summary = String(parsed.args.summary ?? "");
       const status = parsed.args.status === "blocked" ? "blocked" : "done";
-      args.conversation.steps.push({
-        step,
+      recordStep(args.conversation, {
         reasoning: parsed.reasoning,
         tool: "finish",
         args: parsed.args,
         result: { ok: true, output: summary },
-        at: new Date().toISOString(),
       });
       return { summary, status };
     }
@@ -1026,17 +1194,17 @@ export async function runLoop(
         consecutiveErrors += 1;
         lastFailure = `request_write ${p}: ${msg}`;
         history.push({ role: "model", parts: [{ text: responseText }] });
+        const stepNo = args.conversation.steps.length + 1;
         history.push({
           role: "user",
+          step: stepNo,
           parts: [{ text: `Tool result (error): ${msg}` }],
         });
-        args.conversation.steps.push({
-          step: args.conversation.steps.length + 1,
+        recordStep(args.conversation, {
           reasoning: parsed.reasoning,
           tool: "request_write",
           args: { path: p },
           result: { ok: false, output: msg },
-          at: new Date().toISOString(),
         });
         await saveConversation(args.conversation, args.targetRepo, args.appToken);
         continue;
@@ -1063,33 +1231,49 @@ export async function runLoop(
       continue;
     }
 
-    const result = await runTool(parsed.tool, parsed.args).catch((e) => ({
-      ok: false,
-      output: String(e?.message ?? e),
-    }));
+    const result: ToolResult = await runTool(parsed.tool, parsed.args).catch(
+      (e) => ({
+        ok: false,
+        output: String(e?.message ?? e),
+      }),
+    );
 
-    args.conversation.steps.push({
-      step,
-      reasoning: parsed.reasoning,
-      tool: parsed.tool,
-      args: parsed.args,
-      result: {
-        ok: result.ok,
-        output: truncate(result.output, 2000),
-        truncated: result.output.length > 2000,
+    const isBash = parsed.tool === "run_bash";
+    const historyOutput = isBash
+      ? truncateHeadTail(result.output, BASH_HEAD_CHARS, BASH_TAIL_CHARS)
+      : truncate(result.output, 4000);
+
+    const stepNo = args.conversation.steps.length + 1;
+    recordStep(
+      args.conversation,
+      {
+        reasoning: parsed.reasoning,
+        tool: parsed.tool,
+        args: parsed.args,
+        result: {
+          ok: result.ok,
+          output: truncate(result.output, 2000),
+          truncated: result.output.length > 2000,
+        },
       },
-      at: new Date().toISOString(),
-    });
+      isBash
+        ? {
+            exitCode: result.exitCode,
+            keyLines: result.keyLines,
+            keyLinesTotal: result.keyLinesTotal,
+            testSummary: result.testSummary,
+          }
+        : undefined,
+      isBash,
+    );
 
     history.push({ role: "model", parts: [{ text: responseText }] });
     history.push({
       role: "user",
+      step: stepNo,
       parts: [
         {
-          text: `Tool result (${result.ok ? "ok" : "error"}):\n${truncate(
-            result.output,
-            4000,
-          )}`,
+          text: `Tool result (${result.ok ? "ok" : "error"}):\n${historyOutput}`,
         },
       ],
     });
@@ -1238,7 +1422,7 @@ async function writeAsAgentBytes(
 async function runTool(
   tool: ToolName,
   args: Record<string, unknown>,
-): Promise<{ ok: boolean; output: string }> {
+): Promise<ToolResult> {
   switch (tool) {
     case "read_file": {
       const p = safePath(String(args.path));
@@ -1250,6 +1434,8 @@ async function runTool(
       const cmd = String(args.command ?? "");
       if (!cmd) return { ok: false, output: "empty command" };
       const result = await runBashWithDetach(cmd);
+      const formatted = formatBashOutput(result);
+      const digest = buildBashDigest(formatted, result.code);
       if (
         result.code === 124 ||
         result.code === 126 ||
@@ -1259,30 +1445,40 @@ async function runTool(
         return {
           ok: false,
           output: `tool failure (exit ${result.code})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+          ...digest,
         };
       }
       return {
         ok: true,
-        output: `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+        output: formatted,
+        ...digest,
       };
     }
     case "git_commit": {
-  const msg = String(args.message ?? "omah: changes");
-  const trailer = process.env.AUTHOR_NAME && process.env.AUTHOR_EMAIL
-    ? `\n\nCo-authored-by: ${process.env.AUTHOR_NAME} <${process.env.AUTHOR_EMAIL}>`
-    : "";
-  await asAgent("git", ["add", "-A"]);
-  const { stdout, stderr, code } = await asAgent("git", [
-    "commit",
-    "-m",
-    msg + trailer,
-  ]);
-  if (code !== 0) return { ok: false, output: stderr };
-  return { ok: true, output: stdout };
-}
+      const msg = String(args.message ?? "omah: changes");
+      const trailer = process.env.AUTHOR_NAME && process.env.AUTHOR_EMAIL
+        ? `\n\nCo-authored-by: ${process.env.AUTHOR_NAME} <${process.env.AUTHOR_EMAIL}>`
+        : "";
+      await asAgent("git", ["add", "-A"]);
+      const { stdout, stderr, code } = await asAgent("git", [
+        "commit",
+        "-m",
+        msg + trailer,
+      ]);
+      if (code !== 0) return { ok: false, output: stderr };
+      return { ok: true, output: stdout };
+    }
     default:
       return { ok: false, output: `unknown tool: ${tool}` };
   }
+}
+
+function formatBashOutput(result: {
+  stdout: string;
+  stderr: string;
+  code: number;
+}): string {
+  return `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
 }
 
 async function runBashWithDetach(
@@ -1480,8 +1676,6 @@ interface PushArgs {
   branchName: string;
   conversation: Conversation;
   startSha: string;
-  botName: string;
-  botEmail: string;
   authorName: string;
   authorEmail: string;
   ignorePatterns: string[];
@@ -1632,23 +1826,19 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
   }
 
   const commitMsg = args.conversation.summary ?? "omah: changes";
-const trailer =
-  args.authorName && args.authorEmail
-    ? `\n\nCo-authored-by: ${args.authorName} <${args.authorEmail}>`
-    : "";
-const commitResult = await asOrchestrator(
-  "git",
-  [
-    "-c",
-    `user.name=${args.botName}`,
-    "-c",
-    `user.email=${args.botEmail}`,
-    "commit",
-    "-m",
-    commitMsg + trailer,
-  ],
-  { cwd: pushClone },
-);
+  const commitResult = await asOrchestrator(
+    "git",
+    [
+      "-c",
+      `user.name=${args.authorName}`,
+      "-c",
+      `user.email=${args.authorEmail}`,
+      "commit",
+      "-m",
+      commitMsg,
+    ],
+    { cwd: pushClone },
+  );
   if (commitResult.code !== 0) {
     throw new Error(`commit failed: ${commitResult.stderr}`);
   }
@@ -2378,6 +2568,20 @@ function truncate(s: string, n: number): string {
   return s.length <= n
     ? s
     : s.slice(0, n) + `\n… [truncated ${s.length - n} chars]`;
+}
+
+function truncateHeadTail(
+  s: string,
+  headChars: number,
+  tailChars: number,
+): string {
+  if (s.length <= headChars + tailChars) return s;
+  const omitted = s.length - headChars - tailChars;
+  return (
+    s.slice(0, headChars) +
+    `\n… [truncated ${omitted} chars]\n` +
+    s.slice(-tailChars)
+  );
 }
 
 function shortId(): string {
