@@ -98,7 +98,7 @@ const REVIEW_MAX_FILE_DIFF_BYTES = 10 * 1024;
 const REVIEW_TEST_TIMEOUT_MS = 3 * 60 * 1000;
 const REVIEW_MIN_REMAINING_MS = 4 * 60 * 1000;
 const REVIEW_FIX_BUDGET_MS = 4 * 60 * 1000;
-const REVIEW_MAX_CALLS = 3;
+const REVIEW_MAX_CALLS = 6;
 
 const REVIEWER_SYSTEM_PROMPT =
   "You review code changes produced by another agent. Reply with strict JSON only.";
@@ -110,7 +110,6 @@ const REVIEWER_SYSTEM_PROMPT =
 interface Message {
   role: "user" | "model";
   parts: Array<{ text: string }>;
-  /** Step number this message pairs with. Set on tool-result pushes only. */
   step?: number;
 }
 
@@ -145,9 +144,7 @@ export interface Conversation {
   summary?: string;
   status?: "done" | "blocked";
   startedAt: string;
-  /** Set when the review gate found actionable issues. */
   reviewConcerns?: boolean;
-  /** The issues the reviewer and the harness raised. */
   reviewIssues?: ReviewIssue[];
 }
 
@@ -215,6 +212,7 @@ interface ReviewGateArgs {
   targetRepo: string;
   branchName: string;
   runStartedAt: number;
+  cooldownUntil: Map<number, number>;
 }
 
 interface ReviewGateOutcome {
@@ -513,21 +511,26 @@ async function main(): Promise<void> {
       keys.map((k, i) => `${i + 1}=${k.provider}`).join(", "),
   );
 
+  const cooldownUntil = new Map<number, number>();
+
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
 
   let result: RunLoopResult;
   try {
-    result = await runLoop({
-      systemPrompt,
-      task: taskText,
-      resumeText,
-      conversation,
-      keys,
-      targetRepo,
-      branchName,
-      appToken,
-      startSha,
-    });
+    result = await runLoop(
+      {
+        systemPrompt,
+        task: taskText,
+        resumeText,
+        conversation,
+        keys,
+        targetRepo,
+        branchName,
+        appToken,
+        startSha,
+      },
+      { cooldownUntil },
+    );
   } finally {
     if (metaToken && stateLoadOk && !stateSaved) {
       stateSaved = true;
@@ -552,9 +555,6 @@ async function main(): Promise<void> {
 
   await saveConversation(conversation, targetRepo, appToken);
 
-  // ---------------------------------------------------------------
-  // Review gate (only on status=done)
-  // ---------------------------------------------------------------
   if (result.status === "done" && !conversation.reviewConcerns) {
     const outcome = await runReviewGate({
       conversation,
@@ -564,6 +564,7 @@ async function main(): Promise<void> {
       targetRepo,
       branchName,
       runStartedAt: runStarted,
+      cooldownUntil,
     });
     if (outcome.ran && outcome.issues.length > 0) {
       conversation.reviewIssues = outcome.issues;
@@ -584,7 +585,7 @@ async function main(): Promise<void> {
           appToken,
           startSha,
         },
-        { maxRuntimeMs: REVIEW_FIX_BUDGET_MS },
+        { maxRuntimeMs: REVIEW_FIX_BUDGET_MS, cooldownUntil },
       );
       result = fixResult;
       conversation.summary = fixResult.summary;
@@ -644,10 +645,8 @@ async function runReviewGate(
   }
   if (args.keys.length === 0) return skip("no keys available");
 
-  // 1. Snapshot git status before the fresh test run.
   const beforePaths = await listChangedPaths();
 
-  // 2. Pick the test command.
   const pkg = await readPackageJson();
   const testScript = readTestScript(pkg);
   const command = pickTestCommand(
@@ -655,7 +654,6 @@ async function runReviewGate(
     testScript,
   );
 
-  // 3. Run tests, or report none.
   let testExitCode: number | null = null;
   let testTimedOut = false;
   let testSummary: string | null = null;
@@ -681,10 +679,8 @@ async function runReviewGate(
     await log("[review] no test command; skipping test run");
   }
 
-  // 4. Revert test side effects (only paths new since the snapshot).
   await revertNewChanges(beforePaths);
 
-  // 5. Build the diff and file list.
   const diffResult = await asAgentBuffer("git", [
     "diff",
     "--no-ext-diff",
@@ -711,7 +707,6 @@ async function runReviewGate(
     return skip("empty diff");
   }
 
-  // 6. Build the prompt.
   const prompt = buildReviewPrompt({
     task: args.conversation.taskText,
     diff,
@@ -724,8 +719,11 @@ async function runReviewGate(
     sameProviderAsWriter: false,
   });
 
-  // 7. Call the reviewer, rotating through keys.
-  const call = await callReviewerWithRotation(args.keys, prompt);
+  const call = await callReviewerWithRotation(
+    args.keys,
+    args.cooldownUntil,
+    prompt,
+  );
   if (!call) return skip("reviewer call failed on all attempted keys");
   const sameProviderAsWriter =
     lastUsedProvider !== null && call.provider === lastUsedProvider;
@@ -735,14 +733,12 @@ async function runReviewGate(
     );
   }
 
-  // 8. Parse the verdict.
   const verdict = parseReviewResponse(call.text);
   if (!verdict) {
     await log("[review] could not parse reviewer response; skipping");
     return skip("could not parse reviewer response");
   }
 
-  // 9. Merge with harness-owned issues.
   const harnessIssues = harnessIssuesFromTests({
     hadTests,
     testTimedOut,
@@ -759,7 +755,6 @@ async function runReviewGate(
     return { ran: true, reenter: false, fixMessage: "", issues: merged };
   }
 
-  // 10. Check we can afford the fix round.
   const remainingForFix = WALL_CLOCK_MS - (Date.now() - args.runStartedAt);
   if (remainingForFix < REVIEW_MIN_REMAINING_MS) {
     await log(
@@ -779,19 +774,33 @@ async function runReviewGate(
 
 async function callReviewerWithRotation(
   keys: KeySpec[],
+  cooldownUntil: Map<number, number>,
   prompt: string,
 ): Promise<{ text: string; provider: string } | null> {
-  // Prefer a provider different from the writer's last one.
-  const ordered = lastUsedProvider
-    ? [
-        ...keys.filter((k) => k.provider !== lastUsedProvider),
-        ...keys.filter((k) => k.provider === lastUsedProvider),
-      ]
-    : keys;
+  const now = Date.now();
+  const isCooled = (index: number) => (cooldownUntil.get(index) ?? 0) > now;
+
+  const different: number[] = [];
+  const same: number[] = [];
+  for (let i = 0; i < keys.length; i++) {
+    if (isCooled(i)) continue;
+    if (lastUsedProvider && keys[i].provider === lastUsedProvider) {
+      same.push(i);
+    } else {
+      different.push(i);
+    }
+  }
+  const ordered = [...different, ...same];
 
   const attempts = Math.min(ordered.length, REVIEW_MAX_CALLS);
+  if (attempts === 0) {
+    await log("[review] no uncooled keys available");
+    return null;
+  }
+
   for (let i = 0; i < attempts; i++) {
-    const spec = ordered[i];
+    const keyIndex = ordered[i];
+    const spec = keys[keyIndex];
     try {
       const provider = makeProvider(spec);
       const response = await provider.complete(
@@ -800,16 +809,23 @@ async function callReviewerWithRotation(
           history: [{ role: "user", content: prompt }],
           jsonMode: true,
         },
-        i,
+        keyIndex,
       );
-      await log(`[review] called ${spec.provider}`);
+      await log(`[review] called ${spec.provider} (key ${keyIndex + 1})`);
       return { text: response.text, provider: spec.provider };
     } catch (err: any) {
       const kind = classifyError(err);
+      const status = (err as any)?.status ?? "?";
       await log(
-        `[review] key ${i + 1} (${spec.provider}) failed: ${kind} ` +
-          `${String(err?.message ?? err).slice(0, 100)}`,
+        `[review] key ${keyIndex + 1} (${spec.provider}) failed: ${kind} ` +
+          `[${status}] ${String(err?.message ?? err).slice(0, 100)}`,
       );
+      if (kind === "quota" || kind === "retryable") {
+        const wait = Number((err as any)?.retryAfterMs ?? 60_000);
+        cooldownUntil.set(keyIndex, Date.now() + wait);
+      } else if (kind === "rotate") {
+        cooldownUntil.set(keyIndex, Number.POSITIVE_INFINITY);
+      }
       continue;
     }
   }
@@ -876,6 +892,7 @@ export interface RunLoopOptions {
   maxRuntimeMs?: number;
   callModel?: typeof callModel;
   sharedQuotaProviders?: string[];
+  cooldownUntil?: Map<number, number>;
 }
 
 class RunBudgetExceededError extends Error {}
@@ -988,7 +1005,8 @@ export async function runLoop(
   const startedAt = Date.now();
   const maxRuntimeMs = options.maxRuntimeMs ?? WALL_CLOCK_MS;
   const invokeModel = options.callModel ?? callModel;
-  const cooldownUntil = new Map<number, number>();
+  const cooldownUntil =
+    options.cooldownUntil ?? new Map<number, number>();
   const sharedQuotaInput =
     options.sharedQuotaProviders ??
     process.env.OMAH_SHARED_QUOTA_PROVIDERS ??
