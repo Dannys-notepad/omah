@@ -1,0 +1,46 @@
+name: Omah outcomes
+
+on:
+  schedule:
+    # Daily at 04:00 UTC, one hour after the cleanup workflow.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omah-outcomes
+  cancel-in-progress: false
+
+jobs:
+  outcomes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Resolve run outcomes
+        env:
+          APP_ID: ${{ secrets.OMAH_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.OMAH_APP_PRIVATE_KEY }}
+          OMAH_META_REPO: ${{ vars.OMAH_META_REPO }}
+        run: npx tsx outcomes.ts
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Omah outcomes result"
+            echo ""
+            echo "See the Resolve run outcomes step for details."
+          } >> "$GITHUB_STEP_SUMMARY"
