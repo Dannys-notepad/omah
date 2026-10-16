@@ -765,11 +765,9 @@ for (const secret of scan.secrets) {
 }
 const lowCount = scan.issues.filter((i) => i.severity === "low").length;
 const highCount = scan.issues.filter((i) => i.severity === "high").length;
-if (scan.issues.length > 0) {
-  await log(
-    `[review] scan: ${highCount} secret(s) redacted, ${lowCount} debug/TODO line(s)`,
-  );
-}
+await log(
+  `[review] scan: ${highCount} secret(s) redacted, ${lowCount} debug/TODO line(s)`,
+);
 
   const prompt = buildReviewPrompt({
     task: args.conversation.taskText,
