@@ -291,6 +291,160 @@ async function showStatus(options) {
   }
 }
 
+async function showStats(options) {
+  const controlRepo = await resolveControlRepo(options["control-repo"]);
+  await checkGhAuth();
+
+  let limit = null;
+  if (options["runs"] !== undefined) {
+    limit = Number(options["runs"]);
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new Error("--runs must be a positive integer");
+    }
+  }
+
+  const runs = await fetchRunsFile(controlRepo);
+  if (!runs || runs.length === 0) {
+    console.log("No runs recorded yet.");
+    return;
+  }
+
+  const scoped = limit ? runs.slice(-limit) : runs;
+  printSummary(scoped);
+}
+
+async function fetchRunsFile(controlRepo) {
+  try {
+    const { stdout } = await gh([
+      "api",
+      `repos/${controlRepo}/contents/runs.json?ref=omah-runs`,
+      "--jq",
+      ".content",
+    ]);
+    const b64 = stdout.replace(/\s/g, "");
+    if (!b64) return null;
+    const raw = Buffer.from(b64, "base64").toString("utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.runs)) {
+      return null;
+    }
+    return parsed.runs;
+  } catch (error) {
+    if (/404|not found|not exist/i.test(String(error.message))) return null;
+    throw error;
+  }
+}
+
+function median(arr) {
+  if (arr.length === 0) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+    : sorted[mid];
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${(ms / 60_000).toFixed(1)}m`;
+}
+
+function classifyBlockedReason(summary) {
+  if (!summary) return "(unknown)";
+  const s = summary.toLowerCase();
+  if (s.includes("wall-clock budget")) return "Wall-clock budget exceeded";
+  if (s.includes("consecutive tool errors")) return "Consecutive tool errors";
+  if (s.includes("all llm keys are exhausted")) return "All keys exhausted";
+  if (s.includes("key cooldown")) return "Key cooldown exceeded budget";
+  if (s.includes("refusing to push")) return "Refused to push (secret)";
+  if (s.includes("llm call failed")) return "LLM call failed";
+  return summary.slice(0, 60);
+}
+
+function printSummary(runs) {
+  const total = runs.length;
+  const done = runs.filter((r) => r.status === "done").length;
+  const blocked = total - done;
+  const merged = runs.filter((r) => r.outcome === "merged").length;
+  const edited = runs.filter((r) => r.outcome === "edited").length;
+  const closed = runs.filter((r) => r.outcome === "closed").length;
+  const resolved = merged + edited + closed;
+
+  console.log(`Runs: ${total}  (done ${done}, blocked ${blocked})`);
+  console.log(`Completion rate: ${total > 0 ? Math.round((done / total) * 100) : 0}%`);
+
+  if (resolved > 0) {
+    console.log(
+      `Outcomes: merged ${merged}, edited ${edited}, closed ${closed} ` +
+        `(${resolved} of ${total} resolved)`,
+    );
+  } else {
+    console.log("Outcomes: none recorded yet.");
+  }
+  console.log("");
+
+  const reasons = new Map();
+  for (const run of runs) {
+    if (run.status !== "blocked") continue;
+    const reason = classifyBlockedReason(run.blockedReason || run.summary || "");
+    reasons.set(reason, (reasons.get(reason) || 0) + 1);
+  }
+  if (reasons.size > 0) {
+    console.log("Blocked reasons:");
+    for (const [reason, count] of [...reasons.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${String(count).padStart(3)}  ${reason}`);
+    }
+    console.log("");
+  }
+
+  const successful = runs.filter((r) => r.status === "done");
+  if (successful.length > 0) {
+    const tokensIn = successful.map((r) => r.tokensIn || 0);
+    const tokensOut = successful.map((r) => r.tokensOut || 0);
+    const steps = successful.map((r) => r.steps || 0);
+    console.log("Per successful run (median):");
+    console.log(`  input tokens:  ${median(tokensIn).toLocaleString()}`);
+    console.log(`  output tokens: ${median(tokensOut).toLocaleString()}`);
+    console.log(`  steps:         ${median(steps)}`);
+    console.log("");
+  }
+
+  const byProvider = new Map();
+  for (const run of runs) {
+    for (const k of run.keyStats || []) {
+      const entry = byProvider.get(k.provider) || { calls: 0, rate429: 0, errors: 0 };
+      entry.calls += k.calls;
+      entry.rate429 += k.rate429;
+      entry.errors += k.errors;
+      byProvider.set(k.provider, entry);
+    }
+  }
+  if (byProvider.size > 0) {
+    console.log("Providers:");
+    console.log("  provider        calls     429   errors");
+    for (const [provider, s] of [...byProvider.entries()].sort((a, b) => b[1].calls - a[1].calls)) {
+      console.log(
+        `  ${provider.padEnd(14)} ${String(s.calls).padStart(5)} ` +
+          `${String(s.rate429).padStart(6)} ${String(s.errors).padStart(8)}`,
+      );
+    }
+    console.log("");
+  }
+
+  if (successful.length > 0) {
+    const wallMs = successful.map((r) => r.wallMs || 0);
+    const llmMs = successful.map((r) => r.llmMs || 0);
+    const setupMs = successful.map((r) => r.setupMs || 0);
+    const pushMs = successful.map((r) => r.pushMs || 0);
+    console.log("Wall time per successful run (median):");
+    console.log(`  total: ${formatDuration(median(wallMs))}`);
+    console.log(`  loop:  ${formatDuration(median(llmMs))}`);
+    console.log(`  setup: ${formatDuration(median(setupMs))}`);
+    console.log(`  push:  ${formatDuration(median(pushMs))}`);
+  }
+}
+
 function usage() {
   console.log(`Omah CLI
 
@@ -298,6 +452,7 @@ Usage:
   omah run --repo owner/name (--task TEXT | --task-file PATH) [--base BRANCH] [--provider PROVIDER] [--control-repo owner/omah]
   omah resume --repo owner/name --branch omah/slug-id (--task FOLLOW_UP | --task-file PATH) [--base BRANCH] [--provider PROVIDER] [--control-repo owner/omah]
   omah status [--run-id ID] [--control-repo owner/omah]
+  omah stats [--runs N] [--control-repo owner/omah]
   omah config set control-repo owner/omah
   omah config get control-repo
 
@@ -359,6 +514,12 @@ export async function main(argv = process.argv.slice(2)) {
     const options = parseOptions(rest, new Set(["run-id", "control-repo"]));
     await showStatus(options);
     return;
+  }
+
+  if (command === "stats") {
+  const options = parseOptions(rest, new Set(["runs", "control-repo"]));
+  await showStats(options);
+  return;
   }
 
   throw new Error(`Unknown command: ${command}`);
