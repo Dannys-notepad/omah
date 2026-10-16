@@ -50,7 +50,9 @@ import {
   pickTestCommand,
   readTestScript,
   reviewConcernsStatusLine,
+  scanDiffForIssues,
   truncateDiff,
+  type DiffScanResult,
   type ReviewIssue,
 } from "./src/review.js";
 
@@ -598,6 +600,32 @@ async function main(): Promise<void> {
     }
   }
 
+  let refuseToPush = false;
+{
+  const scanResult = await scanWorkspaceDiffForSecrets(startSha);
+  for (const secret of scanResult.secrets) {
+    console.log(`::add-mask::${secret}`);
+  }
+  if (scanResult.secrets.length > 0) {
+    const names = scanResult.issues
+      .filter((i) => i.severity === "high")
+      .map((i) => i.file)
+      .join(", ");
+    await log(
+      `[push] refusing to push: possible secret(s) in ${names}. ` +
+        `Remove them and re-run.`,
+    );
+    refuseToPush = true;
+    result = {
+      summary: `Refusing to push: possible secrets remain in ${names}. Remove them and re-run.`,
+      status: "blocked",
+    };
+    conversation.summary = result.summary;
+    conversation.status = result.status;
+    await saveConversation(conversation, targetRepo, appToken);
+  }
+}
+
   if (process.env.OMAH_SCRIPT) {
     try {
       await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
@@ -605,8 +633,13 @@ async function main(): Promise<void> {
   }
   await asOrchestrator("sudo", ["pkill", "-9", "-u", AGENT_USER]);
 
+  let prUrl = "";
+if (refuseToPush) {
+  await log("no push: refusing due to secret findings");
+  setOutput("status", result.status);
+} else {
   const pushStart = Date.now();
-  const prUrl = await pushPatchAndOpenPR({
+  prUrl = await pushPatchAndOpenPR({
     appToken,
     targetRepo,
     baseBranch,
@@ -624,6 +657,7 @@ async function main(): Promise<void> {
     setOutput("pr_url", prUrl);
   }
   setOutput("status", result.status);
+}
 
   await log(`done. pr=${prUrl || "(none)"} status=${result.status}`);
 }
@@ -710,19 +744,26 @@ try {
     .filter((chunk) => !chunk.startsWith("diff --git a/.git/"))
     .join("");
   const diff = truncateDiff(
-    filtered,
-    REVIEW_MAX_FILE_DIFF_BYTES,
-    REVIEW_MAX_DIFF_BYTES,
-  );
-  const fileList = filesFromDiff(diff);
-
-  await log(
-  `[review] diff: ${Buffer.byteLength(diff, "utf8")} bytes, ` +
-    `${fileList.length} file(s)${fileList.length > 0 ? ": " + fileList.join(", ") : ""}`,
+  filtered,
+  REVIEW_MAX_FILE_DIFF_BYTES,
+  REVIEW_MAX_DIFF_BYTES,
 );
+const fileList = filesFromDiff(diff);
 
 if (diff.trim().length === 0) {
   return skip("empty diff");
+}
+
+const scan = scanDiffForIssues(diff, args.conversation.taskText);
+for (const secret of scan.secrets) {
+  console.log(`::add-mask::${secret}`);
+}
+const lowCount = scan.issues.filter((i) => i.severity === "low").length;
+const highCount = scan.issues.filter((i) => i.severity === "high").length;
+if (scan.issues.length > 0) {
+  await log(
+    `[review] scan: ${highCount} secret(s) redacted, ${lowCount} debug/TODO line(s)`,
+  );
 }
 
   const prompt = buildReviewPrompt({
@@ -759,11 +800,14 @@ if (diff.trim().length === 0) {
   }
 
   const harnessIssues = harnessIssuesFromTests({
-    hadTests,
-    testTimedOut,
-    testExitCode,
-  });
-  const merged = mergeIssues(verdict.issues, harnessIssues);
+  hadTests,
+  testTimedOut,
+  testExitCode,
+});
+const merged = mergeIssues(verdict.issues, [
+  ...harnessIssues,
+  ...scan.issues,
+]);
 
   await log(
     `[review] verdict=${verdict.verdict} issues=${merged.length} ` +
@@ -850,6 +894,33 @@ async function callReviewerWithRotation(
     }
   }
   return null;
+}
+
+/**
+ * Recompute the workspace diff and scan it for secrets, without
+ * truncation. Used as a pre-push safety net: if the review gate's fix
+ * round did not remove a secret, or the fix round never ran, this
+ * catches it before anything reaches GitHub.
+ */
+async function scanWorkspaceDiffForSecrets(
+  startSha: string,
+): Promise<DiffScanResult> {
+  const diffResult = await asAgentBuffer("git", [
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    startSha,
+    "--",
+  ]);
+  if (diffResult.code !== 0) {
+    return { issues: [], secrets: [] };
+  }
+  const raw = diffResult.stdout.toString("utf8");
+  const filtered = raw
+    .split(/^(?=diff --git )/m)
+    .filter((chunk) => !chunk.startsWith("diff --git a/.git/"))
+    .join("");
+  return scanDiffForIssues(filtered, "");
 }
 
 async function listChangedPaths(): Promise<Set<string>> {

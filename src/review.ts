@@ -460,3 +460,184 @@ function extractFirstJsonObject(text: string): string | null {
   }
   return null;
 }
+
+
+// ---------------------------------------------------------------
+// Harness-owned diff scan
+// ---------------------------------------------------------------
+
+export interface DiffScanResult {
+  issues: ReviewIssue[];
+  /** Raw secret values. The caller must log ::add-mask:: for each. */
+  secrets: string[];
+}
+
+const NOISE_PATH_PATTERNS: RegExp[] = [
+  /\.md$/i,
+  /\.txt$/i,
+  /\.rst$/i,
+  /\.adoc$/i,
+  /(?:^|\/)(?:node_modules|dist|build|vendor|coverage)\//i,
+  /(?:^|\/)__snapshots__\//i,
+  /(?:^|\/)fixtures?\//i,
+  /\.snap$/i,
+  /\.snapshot$/i,
+  /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb|Cargo\.lock|Gemfile\.lock|poetry\.lock)$/i,
+];
+
+const TEST_PATH_PATTERNS: RegExp[] = [
+  /(?:^|\/)__tests__\//i,
+  /(?:^|\/)tests?\//i,
+  /\.test\.[a-z]+$/i,
+  /\.spec\.[a-z]+$/i,
+];
+
+const CLI_PATH_PATTERNS: RegExp[] = [
+  /(?:^|\/)bin\//i,
+  /\.cli\.[a-z]+$/i,
+];
+
+const CONSOLE_PATTERN = /\bconsole\.(log|debug|trace|dir)\s*\(/;
+const DEBUGGER_PATTERN = /(^|[^.\w])debugger(\s*;)?\s*$/;
+const TODO_PATTERN = /\b(TODO|FIXME|XXX)\b/;
+
+const SECRET_FORMATS: RegExp[] = [
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bghp_[a-zA-Z0-9]{36}\b/,
+  /\bghs_[a-zA-Z0-9]{36}\b/,
+  /\bgho_[a-zA-Z0-9]{36}\b/,
+  /\bsk-[a-zA-Z0-9]{20,}\b/,
+  /\bsk_live_[a-zA-Z0-9]{20,}\b/,
+  /\bxox[bpoas]-[a-zA-Z0-9-]{10,}\b/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+
+const SECRET_NAME_HINT =
+  /(?<![A-Za-z0-9])(?:key|token|secret|password|passwd|credential)s?(?![A-Za-z0-9])/i;
+const PLACEHOLDER_PREFIX = /^(?:your|my|the|example|sample|test|dummy|fake|placeholder|changeme|xxx)/i;
+
+/**
+ * Deterministic scan of a diff for debug code and secrets. Debug findings
+ * are low severity and do not trigger a fix round. Secret findings are
+ * high severity and do. The caller must log ::add-mask:: for every value
+ * in `secrets` before anything else touches the log.
+ */
+export function scanDiffForIssues(
+  diff: string,
+  taskText: string,
+): DiffScanResult {
+  const issues: ReviewIssue[] = [];
+  const secrets: string[] = [];
+  const taskLower = taskText.toLowerCase();
+
+  let currentFile = "";
+  const lines = diff.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+
+    const headerMatch = raw.match(/^\+\+\+\s+b\/(.+)$/);
+    if (headerMatch) {
+      currentFile = headerMatch[1];
+      continue;
+    }
+
+    if (!raw.startsWith("+")) continue;
+    if (raw.startsWith("+++")) continue;
+    if (!currentFile) continue;
+
+    if (isNoisePath(currentFile)) continue;
+
+    const content = raw.slice(1);
+    const lineNo = estimateLineNumber(lines, i);
+    const fileIsTest = TEST_PATH_PATTERNS.some((p) => p.test(currentFile));
+    const fileIsCli = CLI_PATH_PATTERNS.some((p) => p.test(currentFile));
+    const fileInTask = pathMentionedInTask(currentFile, taskLower);
+
+    if (!fileIsTest) {
+      if (CONSOLE_PATTERN.test(content) && !fileInTask && !fileIsCli) {
+        issues.push({
+          file: currentFile,
+          severity: "low",
+          note: `Added console.* at line ${lineNo}. Remove before merge.`,
+        });
+      }
+      if (DEBUGGER_PATTERN.test(content)) {
+        issues.push({
+          file: currentFile,
+          severity: "low",
+          note: `Added debugger statement at line ${lineNo}. Remove before merge.`,
+        });
+      }
+      if (TODO_PATTERN.test(content)) {
+        issues.push({
+          file: currentFile,
+          severity: "low",
+          note: `Added TODO/FIXME/XXX marker at line ${lineNo}.`,
+        });
+      }
+    }
+
+    const secret = looksLikeSecret(content);
+    if (secret) {
+      secrets.push(secret);
+      const label = redactLabel(content);
+      issues.push({
+        file: currentFile,
+        severity: "high",
+        note: `Possible secret at line ${lineNo}: ${label}. Remove before merge.`,
+      });
+    }
+  }
+
+  return { issues, secrets };
+}
+
+function isNoisePath(path: string): boolean {
+  return NOISE_PATH_PATTERNS.some((re) => re.test(path));
+}
+
+function pathMentionedInTask(path: string, taskLower: string): boolean {
+  if (taskLower.includes(path.toLowerCase())) return true;
+  const base = path.split("/").pop() ?? "";
+  if (base && taskLower.includes(base.toLowerCase())) return true;
+  return false;
+}
+
+function estimateLineNumber(lines: string[], index: number): number {
+  for (let i = index; i >= 0; i--) {
+    const h = lines[i].match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (!h) continue;
+    const start = Number(h[1]);
+    let count = 0;
+    for (let j = i + 1; j <= index; j++) {
+      const l = lines[j];
+      if (l.startsWith("+") || l.startsWith(" ")) count++;
+    }
+    return start + Math.max(0, count - 1);
+  }
+  return 0;
+}
+
+function looksLikeSecret(line: string): string | null {
+  for (const re of SECRET_FORMATS) {
+    const m = line.match(re);
+    if (m) return m[0];
+  }
+  if (!SECRET_NAME_HINT.test(line)) return null;
+  const literalRe = /["']([^"'\s]{20,})["']/g;
+  let m: RegExpExecArray | null;
+  while ((m = literalRe.exec(line)) !== null) {
+    const value = m[1];
+    if (/^[0-9a-fA-F]+$/.test(value)) continue;
+    if (PLACEHOLDER_PREFIX.test(value)) continue;
+    return value;
+  }
+  return null;
+}
+
+function redactLabel(line: string): string {
+  const nameMatch = line.match(/([A-Za-z_][A-Za-z0-9_]{0,30})\s*[:=]\s*["']/);
+  const name = nameMatch ? nameMatch[1] : "value";
+  return `${name}=…[redacted]`;
+}

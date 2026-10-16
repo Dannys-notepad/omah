@@ -12,6 +12,7 @@ import {
   pickTestCommand,
   readTestScript,
   reviewConcernsStatusLine,
+  scanDiffForIssues,
   truncateDiff,
   type ReviewIssue,
 } from "../src/review.js";
@@ -341,4 +342,165 @@ test("pickTestCommand finds the test segment among unrelated ones", () => {
     { tool: "run_bash", args: { command: "ls && pnpm install && pnpm test" } },
   ];
   assert.equal(pickTestCommand(steps, null), "pnpm test");
+});
+
+// ---------------------------------------------------------------
+// scanDiffForIssues
+// ---------------------------------------------------------------
+
+test("scanDiffForIssues flags console.log on an added source line", () => {
+  const diff = [
+    "diff --git a/src/index.js b/src/index.js",
+    "--- a/src/index.js",
+    "+++ b/src/index.js",
+    "@@ -1,2 +1,3 @@",
+    " // header",
+    "+console.log('debug');",
+    " module.exports = {};",
+  ].join("\n");
+
+  const result = scanDiffForIssues(diff, "Add a comment");
+  assert.equal(result.issues.length, 1);
+  assert.equal(result.issues[0].file, "src/index.js");
+  assert.equal(result.issues[0].severity, "low");
+  assert.match(result.issues[0].note, /console/);
+});
+
+test("scanDiffForIssues skips console.log in test files", () => {
+  const diff = [
+    "+++ b/src/foo.test.js",
+    "@@ -1,1 +1,2 @@",
+    "+console.log('expected');",
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").issues.length, 0);
+});
+
+test("scanDiffForIssues skips console.log in bin/ paths", () => {
+  const diff = [
+    "+++ b/bin/zorx.js",
+    "@@ -1,1 +1,2 @@",
+    "+console.log('starting');",
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").issues.length, 0);
+});
+
+test("scanDiffForIssues skips when the task names the file", () => {
+  const diff = [
+    "+++ b/src/index.js",
+    "@@ -1,1 +1,2 @@",
+    "+console.log('loaded');",
+  ].join("\n");
+  assert.equal(
+    scanDiffForIssues(diff, "Add a console.log to src/index.js").issues.length,
+    0,
+  );
+});
+
+test("scanDiffForIssues flags debugger and TODO", () => {
+  const diff = [
+    "+++ b/src/a.js",
+    "@@ -1,1 +1,3 @@",
+    "+debugger;",
+    "+// TODO: fix this",
+  ].join("\n");
+  const result = scanDiffForIssues(diff, "");
+  assert.equal(result.issues.length, 2);
+  assert.ok(result.issues.every((i) => i.severity === "low"));
+});
+
+test("scanDiffForIssues skips markdown and lockfiles", () => {
+  const md = [
+    "+++ b/README.md",
+    "@@ -1,1 +1,2 @@",
+    "+console.log('docs');",
+  ].join("\n");
+  const lock = [
+    "+++ b/pnpm-lock.yaml",
+    "@@ -1,1 +1,2 @@",
+    "+console.log('lock');",
+  ].join("\n");
+  assert.equal(scanDiffForIssues(md, "").issues.length, 0);
+  assert.equal(scanDiffForIssues(lock, "").issues.length, 0);
+});
+
+test("scanDiffForIssues ignores context and removed lines", () => {
+  const diff = [
+    "+++ b/src/a.js",
+    "@@ -1,2 +1,2 @@",
+    " console.log('already there');",
+    "-console.log('removed');",
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").issues.length, 0);
+});
+
+test("scanDiffForIssues detects an AWS access key", () => {
+  const diff = [
+    "+++ b/src/config.js",
+    "@@ -1,1 +1,2 @@",
+    '+const key = "AKIAIOSFODNN7EXAMPLE";',
+  ].join("\n");
+  const result = scanDiffForIssues(diff, "");
+  assert.equal(result.secrets.length, 1);
+  assert.equal(result.secrets[0], "AKIAIOSFODNN7EXAMPLE");
+  assert.equal(result.issues.filter((i) => i.severity === "high").length, 1);
+});
+
+test("scanDiffForIssues detects a GitHub token", () => {
+  const diff = [
+    "+++ b/.env.example",
+    "@@ -1,1 +1,2 @@",
+    '+TOKEN="ghp_1234567890abcdefghijklmnopqrstuvwx"',
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").secrets.length, 1);
+});
+
+test("scanDiffForIssues detects a private key header", () => {
+  const diff = [
+    "+++ b/key.pem",
+    "@@ -1,1 +1,2 @@",
+    "+-----BEGIN RSA PRIVATE KEY-----",
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").secrets.length, 1);
+});
+
+test("scanDiffForIssues flags a long literal next to a secret name", () => {
+  const diff = [
+    "+++ b/src/auth.js",
+    "@@ -1,1 +1,2 @@",
+    '+const api_token = "abc123def456ghi789jkl012mno345";',
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").secrets.length, 1);
+});
+
+test("scanDiffForIssues ignores placeholder values", () => {
+  const diff = [
+    "+++ b/src/auth.js",
+    "@@ -1,1 +1,2 @@",
+    '+const api_token = "your_token_here_placeholder";',
+  ].join("\n");
+  assert.equal(scanDiffForIssues(diff, "").secrets.length, 0);
+});
+
+test("scanDiffForIssues redacts the secret in its note", () => {
+  const diff = [
+    "+++ b/src/config.js",
+    "@@ -1,1 +1,2 @@",
+    '+const secret = "AKIAIOSFODNN7EXAMPLE";',
+  ].join("\n");
+  const result = scanDiffForIssues(diff, "");
+  const high = result.issues.find((i) => i.severity === "high");
+  assert.ok(high);
+  assert.match(high.note, /redacted/);
+  assert.doesNotMatch(high.note, /AKIAIOSFODNN7EXAMPLE/);
+});
+
+test("scanDiffForIssues reports a plausible line number", () => {
+  const diff = [
+    "+++ b/src/a.js",
+    "@@ -5,2 +5,3 @@",
+    " existing",
+    "+console.log('x');",
+  ].join("\n");
+  const result = scanDiffForIssues(diff, "");
+  assert.match(result.issues[0].note, /line 6/);
 });
