@@ -703,9 +703,14 @@ async function runReviewGate(
   );
   const fileList = filesFromDiff(diff);
 
-  if (diff.trim().length === 0) {
-    return skip("empty diff");
-  }
+  await log(
+  `[review] diff: ${Buffer.byteLength(diff, "utf8")} bytes, ` +
+    `${fileList.length} file(s)${fileList.length > 0 ? ": " + fileList.join(", ") : ""}`,
+);
+
+if (diff.trim().length === 0) {
+  return skip("empty diff");
+}
 
   const prompt = buildReviewPrompt({
     task: args.conversation.taskText,
