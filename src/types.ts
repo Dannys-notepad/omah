@@ -67,15 +67,10 @@ export interface WriteState {
 }
 
 export type ChunkErrorCode =
-  | "TOOL_CALL_GUARD"
-  | "MISSING_SENTINEL"
-  | "CHUNK_TOO_LARGE"
-  | "FILE_TOO_LARGE";
+  "TOOL_CALL_GUARD" | "MISSING_SENTINEL" | "CHUNK_TOO_LARGE" | "FILE_TOO_LARGE";
 
 export type ChunkOutcome =
-  | { kind: "more" }
-  | { kind: "end" }
-  | { kind: "error"; code: ChunkErrorCode; message: string };
+  { kind: "more" } | { kind: "end" } | { kind: "error"; code: ChunkErrorCode; message: string };
 
 export interface UsageInfo {
   input: number;

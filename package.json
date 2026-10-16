@@ -8,15 +8,18 @@
   },
   "scripts": {
     "start": "tsx agent.ts",
-    "test": "tsx --test test/agent-loop.test.ts test/history.test.ts test/review.test.ts test/llm-tools.test.ts test/tool-contract.test.ts test/cli.test.js"
+    "test": "tsx --test test/agent-loop.test.ts test/history.test.ts test/review.test.ts test/llm-tools.test.ts test/tool-contract.test.ts test/cli.test.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
     "ignore": "^6.0.2"
   },
   "devDependencies": {
+    "@types/node": "^22.9.0",
+    "prettier": "^3.9.10",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3",
-    "@types/node": "^22.9.0"
+    "typescript": "^5.6.3"
   }
 }

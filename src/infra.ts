@@ -16,7 +16,7 @@ import {
   AGENT_USER,
   AGENT_HOME,
   WORKSPACE,
- //OMAH_ROOT,
+  //OMAH_ROOT,
   IGNORE_FILE_PATH,
   MAX_PATCH_BYTES,
 } from "./config.js";
@@ -36,23 +36,13 @@ export function sleep(ms: number): Promise<void> {
 }
 
 export function truncate(s: string, n: number): string {
-  return s.length <= n
-    ? s
-    : s.slice(0, n) + `\n… [truncated ${s.length - n} chars]`;
+  return s.length <= n ? s : s.slice(0, n) + `\n… [truncated ${s.length - n} chars]`;
 }
 
-export function truncateHeadTail(
-  s: string,
-  headChars: number,
-  tailChars: number,
-): string {
+export function truncateHeadTail(s: string, headChars: number, tailChars: number): string {
   if (s.length <= headChars + tailChars) return s;
   const omitted = s.length - headChars - tailChars;
-  return (
-    s.slice(0, headChars) +
-    `\n… [truncated ${omitted} chars]\n` +
-    s.slice(-tailChars)
-  );
+  return s.slice(0, headChars) + `\n… [truncated ${omitted} chars]\n` + s.slice(-tailChars);
 }
 
 export function shortId(): string {
@@ -193,9 +183,7 @@ export async function asAgentBuffer(
       chunks.push(d);
     });
     child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", (err) =>
-      resolve({ stdout: Buffer.alloc(0), stderr: err.message, code: 1 }),
-    );
+    child.on("error", (err) => resolve({ stdout: Buffer.alloc(0), stderr: err.message, code: 1 }));
     child.on("close", (code) => {
       if (killed) {
         resolve({
@@ -225,9 +213,7 @@ export function gitAuthEnv(token: string): Record<string, string> {
 // ---------------------------------------------------------------
 
 export type PickResult =
-  | { kind: "ready"; index: number }
-  | { kind: "wait"; waitMs: number }
-  | { kind: "exhausted" };
+  { kind: "ready"; index: number } | { kind: "wait"; waitMs: number } | { kind: "exhausted" };
 
 export function pickKey(
   keys: KeySpec[],
@@ -257,16 +243,12 @@ export function loadKeys(): KeySpec[] {
     console.log(`::add-mask::${k.key}`);
   }
 
-  const preferred = (process.env.INPUT_PROVIDER || "default")
-    .trim()
-    .toLowerCase();
+  const preferred = (process.env.INPUT_PROVIDER || "default").trim().toLowerCase();
   if (preferred && preferred !== "default") {
     const first = specs.filter((k) => k.provider === preferred);
     const rest = specs.filter((k) => k.provider !== preferred);
     if (first.length === 0) {
-      console.warn(
-        `[omah] preference "${preferred}" matched no keys; using default order`,
-      );
+      console.warn(`[omah] preference "${preferred}" matched no keys; using default order`);
       return specs;
     }
     return [...first, ...rest];
@@ -316,25 +298,11 @@ export async function prepareWorkspaceForAgent(
     throw new Error(`clone failed: ${cloneResult.stderr}`);
   }
 
-  await asOrchestrator("sudo", [
-    "chown",
-    "-R",
-    `${AGENT_USER}:${AGENT_USER}`,
-    WORKSPACE,
-  ]);
-  await asOrchestrator("sudo", [
-    "git",
-    "config",
-    "--system",
-    "safe.directory",
-    WORKSPACE,
-  ]);
+  await asOrchestrator("sudo", ["chown", "-R", `${AGENT_USER}:${AGENT_USER}`, WORKSPACE]);
+  await asOrchestrator("sudo", ["git", "config", "--system", "safe.directory", WORKSPACE]);
 }
 
-export async function configureGitIdentityAsAgent(
-  name: string,
-  email: string,
-): Promise<void> {
+export async function configureGitIdentityAsAgent(name: string, email: string): Promise<void> {
   await asAgent("git", ["config", "user.name", name]);
   await asAgent("git", ["config", "user.email", email]);
 }
@@ -393,11 +361,7 @@ export async function applyIgnoreList(patterns: string[]): Promise<void> {
     }
   }
   if (toSkipWorktree.length > 0) {
-    await asAgent("git", [
-      "update-index",
-      "--skip-worktree",
-      ...toSkipWorktree,
-    ]);
+    await asAgent("git", ["update-index", "--skip-worktree", ...toSkipWorktree]);
   }
 }
 
@@ -448,10 +412,7 @@ export async function saveConversation(
     });
     if (r.code !== 0) throw new Error(`state checkout failed: ${r.stderr}`);
 
-    await fs.writeFile(
-      path.join(tmp, "conversation.json"),
-      JSON.stringify(c, null, 2),
-    );
+    await fs.writeFile(path.join(tmp, "conversation.json"), JSON.stringify(c, null, 2));
     r = await asOrchestrator("git", ["add", "conversation.json"], { cwd: tmp });
     if (r.code !== 0) throw new Error(`state add failed: ${r.stderr}`);
 
@@ -472,11 +433,10 @@ export async function saveConversation(
       await log(`state commit warning: ${r.stderr}`);
     }
 
-    r = await asOrchestrator(
-      "git",
-      ["push", "-f", "origin", `HEAD:refs/heads/${stateBranch}`],
-      { cwd: tmp, env: gitAuthEnv(token) },
-    );
+    r = await asOrchestrator("git", ["push", "-f", "origin", `HEAD:refs/heads/${stateBranch}`], {
+      cwd: tmp,
+      env: gitAuthEnv(token),
+    });
     if (r.code !== 0) throw new Error(`state push failed: ${r.stderr}`);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });

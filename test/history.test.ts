@@ -19,19 +19,14 @@ const START_SHA = "abc123def456";
 const PAD = "x".repeat(30_000);
 
 function freshHistory(task = "Do the thing."): HistoryMessage[] {
-  return [
-    { role: "user", parts: [{ text: `Task: ${task}\n${PAD}` }] },
-  ];
+  return [{ role: "user", parts: [{ text: `Task: ${task}\n${PAD}` }] }];
 }
 
 /**
  * Build a history of N tool-result pairs, all older than RECENT_KEEP so
  * they are eligible for stubbing. The last `recent` messages stay verbatim.
  */
-function historyWithSteps(
-  steps: HistoryStep[],
-  recent: number = 0,
-): HistoryMessage[] {
+function historyWithSteps(steps: HistoryStep[], recent: number = 0): HistoryMessage[] {
   const history = freshHistory();
   for (const step of steps) {
     history.push({
@@ -132,10 +127,12 @@ function commitStep(step: number, message: string): HistoryStep {
 // ---------------------------------------------------------------
 
 test("fires on size alone when steps are below the minimum", () => {
-  const steps = [readStep(1, "src/a.ts", "body\n".repeat(100), {
-    outputBytes: 500,
-    outputLines: 100,
-  })];
+  const steps = [
+    readStep(1, "src/a.ts", "body\n".repeat(100), {
+      outputBytes: 500,
+      outputLines: 100,
+    }),
+  ];
   const history = historyWithSteps(steps, 6);
 
   const result = compressHistory(
@@ -178,7 +175,6 @@ test("does nothing when neither gate is met", () => {
 
   assert.equal(result.didCompress, false);
 });
-
 
 test("does nothing when estimated tokens are below the threshold", () => {
   const steps = [readStep(1, "src/a.ts", "body")];
@@ -431,9 +427,7 @@ test("leaves already-compressed messages alone", () => {
 });
 
 test("estimateTokens uses chars-per-token", () => {
-  const history: HistoryMessage[] = [
-    { role: "user", parts: [{ text: "abcd".repeat(250) }] },
-  ];
+  const history: HistoryMessage[] = [{ role: "user", parts: [{ text: "abcd".repeat(250) }] }];
   assert.equal(estimateTokens(history), 250);
 });
 
@@ -515,10 +509,7 @@ test("compresses a realistic 14-step history and preserves anchors", () => {
   assert.equal(result.didCompress, true);
 
   const after = estimateTokens(history);
-  assert.ok(
-    after < before * 0.75,
-    `expected at least 25% reduction, got ${before} -> ${after}`,
-  );
+  assert.ok(after < before * 0.75, `expected at least 25% reduction, got ${before} -> ${after}`);
 
   // Anchors the model needs after compression.
   const allText = history.map((m) => m.parts[0].text).join("\n");

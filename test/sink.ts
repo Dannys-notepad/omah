@@ -8,10 +8,7 @@ import { appendFileSync } from "node:fs";
 const LOG = "/tmp/omah-attack/sink.log";
 
 const server = http.createServer((req, res) => {
-  const lines: string[] = [
-    `--- ${new Date().toISOString()} ---`,
-    `${req.method} ${req.url}`,
-  ];
+  const lines: string[] = [`--- ${new Date().toISOString()} ---`, `${req.method} ${req.url}`];
   for (const [k, v] of Object.entries(req.headers)) {
     lines.push(`${k}: ${v}`);
   }

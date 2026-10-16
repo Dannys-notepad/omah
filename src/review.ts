@@ -48,14 +48,10 @@ export const REVIEW_MAX_ISSUES = 10;
 const REVIEW_NOTE_CHARS = 280;
 
 /** Test command pattern. Matches the loop's isTestCommand in history.ts. */
-const TEST_COMMAND_PATTERN =
-  /\b(test|vitest|jest|pytest|npm test|pnpm test|yarn test)\b/i;
+const TEST_COMMAND_PATTERN = /\b(test|vitest|jest|pytest|npm test|pnpm test|yarn test)\b/i;
 
 /** Severities that warrant a fix round. */
-const ACTIONABLE_SEVERITIES: ReadonlySet<ReviewIssue["severity"]> = new Set([
-  "medium",
-  "high",
-]);
+const ACTIONABLE_SEVERITIES: ReadonlySet<ReviewIssue["severity"]> = new Set(["medium", "high"]);
 
 // ---------------------------------------------------------------
 // Test command selection
@@ -317,9 +313,7 @@ export function harnessIssuesFromTests(args: {
  * the actionable issues and nothing else.
  */
 export function buildFixRoundMessage(issues: ReviewIssue[]): string {
-  const actionable = issues.filter((i) =>
-    ACTIONABLE_SEVERITIES.has(i.severity),
-  );
+  const actionable = issues.filter((i) => ACTIONABLE_SEVERITIES.has(i.severity));
   const lines: string[] = [];
   lines.push("A reviewer found issues with your previous change:");
   lines.push("");
@@ -348,13 +342,9 @@ export function reviewConcernsStatusLine(args: {
   fixRoundAttempted: boolean;
   issues: ReviewIssue[];
 }): string {
-  const count = args.issues.filter((i) =>
-    ACTIONABLE_SEVERITIES.has(i.severity),
-  ).length;
+  const count = args.issues.filter((i) => ACTIONABLE_SEVERITIES.has(i.severity)).length;
   const noun = count === 1 ? "issue" : "issues";
-  const fix = args.fixRoundAttempted
-    ? "fix round attempted"
-    : "fix round skipped (budget)";
+  const fix = args.fixRoundAttempted ? "fix round attempted" : "fix round skipped (budget)";
   return `Draft: review found ${count} ${noun}; ${fix}.`;
 }
 
@@ -382,11 +372,7 @@ export function formatIssuesTable(issues: ReviewIssue[]): string {
  * Truncate a diff per file, then overall. Per-file caps keep one huge
  * generated file from crowding out the real changes.
  */
-export function truncateDiff(
-  diff: string,
-  perFileBytes: number,
-  totalBytes: number,
-): string {
+export function truncateDiff(diff: string, perFileBytes: number, totalBytes: number): string {
   const chunks = diff.split(/^(?=diff --git )/m);
   const truncated = chunks.map((chunk) => {
     const bytes = Buffer.byteLength(chunk, "utf8");
@@ -461,7 +447,6 @@ function extractFirstJsonObject(text: string): string | null {
   return null;
 }
 
-
 // ---------------------------------------------------------------
 // Harness-owned diff scan
 // ---------------------------------------------------------------
@@ -492,10 +477,7 @@ const TEST_PATH_PATTERNS: RegExp[] = [
   /\.spec\.[a-z]+$/i,
 ];
 
-const CLI_PATH_PATTERNS: RegExp[] = [
-  /(?:^|\/)bin\//i,
-  /\.cli\.[a-z]+$/i,
-];
+const CLI_PATH_PATTERNS: RegExp[] = [/(?:^|\/)bin\//i, /\.cli\.[a-z]+$/i];
 
 const CONSOLE_PATTERN = /\bconsole\.(log|debug|trace|dir)\s*\(/;
 const DEBUGGER_PATTERN = /(^|[^.\w])debugger(\s*;)?\s*$/;
@@ -514,7 +496,8 @@ const SECRET_FORMATS: RegExp[] = [
 
 const SECRET_NAME_HINT =
   /(?<![A-Za-z0-9])(?:key|token|secret|password|passwd|credential)s?(?![A-Za-z0-9])/i;
-const PLACEHOLDER_PREFIX = /^(?:your|my|the|example|sample|test|dummy|fake|placeholder|changeme|xxx)/i;
+const PLACEHOLDER_PREFIX =
+  /^(?:your|my|the|example|sample|test|dummy|fake|placeholder|changeme|xxx)/i;
 
 /**
  * Deterministic scan of a diff for debug code and secrets. Debug findings
@@ -522,10 +505,7 @@ const PLACEHOLDER_PREFIX = /^(?:your|my|the|example|sample|test|dummy|fake|place
  * high severity and do. The caller must log ::add-mask:: for every value
  * in `secrets` before anything else touches the log.
  */
-export function scanDiffForIssues(
-  diff: string,
-  taskText: string,
-): DiffScanResult {
+export function scanDiffForIssues(diff: string, taskText: string): DiffScanResult {
   const issues: ReviewIssue[] = [];
   const secrets: string[] = [];
   const taskLower = taskText.toLowerCase();

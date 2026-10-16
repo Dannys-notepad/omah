@@ -45,11 +45,19 @@ test("builds a run dispatch with task text kept as one field", () => {
   );
 
   assert.deepEqual(args, [
-    "workflow", "run", "omah.yml", "--repo", "owner/omah",
-    "--field", "repo=owner/project",
-    "--field", "base_branch=develop",
-    "--field", "provider=gemini",
-    "--field", "task=Fix the login bug\nAdd a regression test",
+    "workflow",
+    "run",
+    "omah.yml",
+    "--repo",
+    "owner/omah",
+    "--field",
+    "repo=owner/project",
+    "--field",
+    "base_branch=develop",
+    "--field",
+    "provider=gemini",
+    "--field",
+    "task=Fix the login bug\nAdd a regression test",
   ]);
 });
 
@@ -65,7 +73,12 @@ test("builds resume fields and rejects invalid targets and branches", () => {
   assert.throws(() => validateRepo("owner/project/extra"), /owner\/name/);
   assert.throws(() => validateBranch("main"), /Omah branch/);
   assert.throws(
-    () => buildWorkflowArgs("run", { repo: "owner/project", task: "x", provider: "invalid" }, "owner/omah"),
+    () =>
+      buildWorkflowArgs(
+        "run",
+        { repo: "owner/project", task: "x", provider: "invalid" },
+        "owner/omah",
+      ),
     /Unknown provider/,
   );
 });

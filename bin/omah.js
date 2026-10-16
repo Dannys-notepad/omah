@@ -134,7 +134,11 @@ export function configFilePath(
 ) {
   const pathApi = platform === "win32" ? path.win32 : path.posix;
   if (platform === "win32") {
-    return pathApi.join(env.APPDATA || pathApi.join(home, "AppData", "Roaming"), "omah", "config.json");
+    return pathApi.join(
+      env.APPDATA || pathApi.join(home, "AppData", "Roaming"),
+      "omah",
+      "config.json",
+    );
   }
   return pathApi.join(env.XDG_CONFIG_HOME || pathApi.join(home, ".config"), "omah", "config.json");
 }
@@ -314,7 +318,9 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === "config") {
     const [action, key, value, ...extra] = rest;
     if (extra.length || key !== "control-repo") {
-      throw new Error("Use `omah config set control-repo owner/name` or `omah config get control-repo`");
+      throw new Error(
+        "Use `omah config set control-repo owner/name` or `omah config get control-repo`",
+      );
     }
     if (action === "set" && value) {
       await writeControlRepo(value);
@@ -326,17 +332,25 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(config.controlRepo);
       return;
     }
-    throw new Error("Use `omah config set control-repo owner/name` or `omah config get control-repo`");
+    throw new Error(
+      "Use `omah config set control-repo owner/name` or `omah config get control-repo`",
+    );
   }
 
   if (command === "run") {
-    const options = parseOptions(rest, new Set(["repo", "task", "task-file", "base", "provider", "control-repo"]));
+    const options = parseOptions(
+      rest,
+      new Set(["repo", "task", "task-file", "base", "provider", "control-repo"]),
+    );
     await dispatch("run", options);
     return;
   }
 
   if (command === "resume") {
-    const options = parseOptions(rest, new Set(["repo", "branch", "task", "task-file", "base", "provider", "control-repo"]));
+    const options = parseOptions(
+      rest,
+      new Set(["repo", "branch", "task", "task-file", "base", "provider", "control-repo"]),
+    );
     await dispatch("resume", options);
     return;
   }
@@ -353,10 +367,7 @@ export async function main(argv = process.argv.slice(2)) {
 function isMainModule() {
   if (!process.argv[1]) return false;
   try {
-    return (
-      realpathSync(process.argv[1]) ===
-      realpathSync(fileURLToPath(import.meta.url))
-    );
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
   } catch {
     return false;
   }

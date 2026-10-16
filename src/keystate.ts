@@ -110,15 +110,11 @@ export async function loadState(
     );
     if (r.code !== 0) {
       const stderr = r.stderr || "";
-      if (
-        /Remote branch .* not found|Could not find remote branch/i.test(stderr)
-      ) {
+      if (/Remote branch .* not found|Could not find remote branch/i.test(stderr)) {
         await log("keystate: no existing state (branch absent)");
         return { state: emptyState(), ok: true };
       }
-      await log(
-        `keystate: load failed (${stderr.split("\n")[0] || "unknown"})`,
-      );
+      await log(`keystate: load failed (${stderr.split("\n")[0] || "unknown"})`);
       return { state: emptyState(), ok: false };
     }
 
@@ -135,9 +131,7 @@ export async function loadState(
       }
     } catch (err: any) {
       if ((err as any)?.code !== "ENOENT") {
-        await log(
-          `keystate: keys.json read failed: ${String(err?.message ?? err).slice(0, 200)}`,
-        );
+        await log(`keystate: keys.json read failed: ${String(err?.message ?? err).slice(0, 200)}`);
       }
     }
 
@@ -159,9 +153,7 @@ export async function loadState(
 
     return { state: { keys, repos }, ok: true };
   } catch (err: any) {
-    await log(
-      `keystate: load failed: ${String(err?.message ?? err).slice(0, 200)}`,
-    );
+    await log(`keystate: load failed: ${String(err?.message ?? err).slice(0, 200)}`);
     return { state: emptyState(), ok: false };
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
@@ -213,14 +205,8 @@ export async function saveState(
     state.keys.updated_at = new Date().toISOString();
     state.repos.updated_at = new Date().toISOString();
 
-    await fs.writeFile(
-      path.join(tmp, KEYS_FILE),
-      JSON.stringify(state.keys, null, 2),
-    );
-    await fs.writeFile(
-      path.join(tmp, REPOS_FILE),
-      JSON.stringify(state.repos, null, 2),
-    );
+    await fs.writeFile(path.join(tmp, KEYS_FILE), JSON.stringify(state.keys, null, 2));
+    await fs.writeFile(path.join(tmp, REPOS_FILE), JSON.stringify(state.repos, null, 2));
 
     r = await execOrchestrator("git", ["add", KEYS_FILE, REPOS_FILE], {
       cwd: tmp,
@@ -251,9 +237,7 @@ export async function saveState(
 
     await log("keystate: saved");
   } catch (err: any) {
-    await log(
-      `keystate: save failed: ${String(err?.message ?? err).slice(0, 200)}`,
-    );
+    await log(`keystate: save failed: ${String(err?.message ?? err).slice(0, 200)}`);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -287,14 +271,7 @@ function nextPacificMidnightMs(): number {
   const offsetHours = month >= 2 && month <= 10 ? -7 : -8;
   const pacific = new Date(now.getTime() + offsetHours * 3600 * 1000);
   const nextMidnightUtc =
-    Date.UTC(
-      pacific.getUTCFullYear(),
-      pacific.getUTCMonth(),
-      pacific.getUTCDate() + 1,
-      0,
-      0,
-      0,
-    ) -
+    Date.UTC(pacific.getUTCFullYear(), pacific.getUTCMonth(), pacific.getUTCDate() + 1, 0, 0, 0) -
     offsetHours * 3600 * 1000;
   return nextMidnightUtc;
 }

@@ -158,11 +158,11 @@ export function compressHistory(
     return { history, didCompress: false };
   }
   const estimated = estimateTokens(history, context.charsPerToken);
-const stepsGateMet = state.stepsSinceLastCompress >= MIN_STEPS_BETWEEN;
-const sizeGateMet = estimated >= MIN_ESTIMATED_TOKENS;
-if (!stepsGateMet && !sizeGateMet) {
-  return { history, didCompress: false };
-}
+  const stepsGateMet = state.stepsSinceLastCompress >= MIN_STEPS_BETWEEN;
+  const sizeGateMet = estimated >= MIN_ESTIMATED_TOKENS;
+  if (!stepsGateMet && !sizeGateMet) {
+    return { history, didCompress: false };
+  }
 
   const cutoff = history.length - RECENT_KEEP;
   if (cutoff <= 1) {
@@ -256,12 +256,11 @@ function readStub(
   const laterWrite = findLaterWrite(allSteps, stepNumber, path);
   const laterRead = findLaterRead(allSteps, stepNumber, path);
 
-  const size =
-    exact
-      ? `${lines} lines, ${bytes} bytes`
-      : lines > 0
-        ? `at least ${lines} lines, ${bytes} bytes`
-        : "size unknown";
+  const size = exact
+    ? `${lines} lines, ${bytes} bytes`
+    : lines > 0
+      ? `at least ${lines} lines, ${bytes} bytes`
+      : "size unknown";
 
   const base = `${COMPRESSED_PREFIX}read ${path}: ${size}`;
 
@@ -312,8 +311,7 @@ function bashStub(text: string, step: HistoryStep): string | null {
   const uniqueKey = keyLines.filter((line) => !shown.has(line));
 
   const status = step.result.ok ? "ok" : "error";
-  const exitLabel =
-    step.result.exitCode !== undefined ? `exit ${step.result.exitCode} ` : "";
+  const exitLabel = step.result.exitCode !== undefined ? `exit ${step.result.exitCode} ` : "";
   const header = `${TOOL_RESULT_PREFIX}${status}): ${exitLabel}`.trimEnd();
 
   const parts: string[] = [...head];
@@ -371,8 +369,7 @@ function commitStub(step: HistoryStep): string | null {
 function genericStub(text: string): string | null {
   if (text.length <= DEFAULT_STUB_LIMIT) return null;
   return (
-    text.slice(0, DEFAULT_STUB_LIMIT) +
-    `\n[truncated ${text.length - DEFAULT_STUB_LIMIT} chars]`
+    text.slice(0, DEFAULT_STUB_LIMIT) + `\n[truncated ${text.length - DEFAULT_STUB_LIMIT} chars]`
   );
 }
 
@@ -385,14 +382,8 @@ function genericStub(text: string): string | null {
  * before truncation; falls back to parsing the truncation marker; then
  * to the visible text length.
  */
-function sizeOf(
-  step: HistoryStep,
-  text: string,
-): { lines: number; bytes: number; exact: boolean } {
-  if (
-    typeof step.result.outputBytes === "number" &&
-    typeof step.result.outputLines === "number"
-  ) {
+function sizeOf(step: HistoryStep, text: string): { lines: number; bytes: number; exact: boolean } {
+  if (typeof step.result.outputBytes === "number" && typeof step.result.outputLines === "number") {
     return {
       lines: step.result.outputLines,
       bytes: step.result.outputBytes,
@@ -431,11 +422,7 @@ function sizeOf(
  * always preserved; the ledger is a suffix after a blank line.
  * Returns true if the message changed.
  */
-function refreshLedger(
-  history: HistoryMessage[],
-  cutoff: number,
-  steps: HistoryStep[],
-): boolean {
+function refreshLedger(history: HistoryMessage[], cutoff: number, steps: HistoryStep[]): boolean {
   const ledger = buildLedger(steps);
   if (!ledger) return false;
 
@@ -446,10 +433,7 @@ function refreshLedger(
   const marker = "\n\nProgress so far:";
   const index = current.indexOf(marker);
 
-  const next =
-    index >= 0
-      ? current.slice(0, index) + "\n\n" + ledger
-      : current + "\n\n" + ledger;
+  const next = index >= 0 ? current.slice(0, index) + "\n\n" + ledger : current + "\n\n" + ledger;
 
   if (next === current) return false;
   head.parts[0].text = next;
@@ -477,17 +461,14 @@ function buildLedger(steps: HistoryStep[]): string {
       isTestCommand(String(step.args.command ?? ""))
     ) {
       // Prefer the stored test summary; fall back to scanning the output.
-      lastTest =
-        step.result.testSummary ??
-        summariseTestOutput(step.result.output);
+      lastTest = step.result.testSummary ?? summariseTestOutput(step.result.output);
     }
   }
 
   const parts: string[] = [];
   if (read.size) parts.push(`read ${[...read].join(", ")}`);
   if (wrote.size) parts.push(`wrote ${[...wrote].join(", ")}`);
-  if (commits.length)
-    parts.push(`committed ${commits.map((c) => `"${c}"`).join(", ")}`);
+  if (commits.length) parts.push(`committed ${commits.map((c) => `"${c}"`).join(", ")}`);
   if (lastTest) parts.push(`last test: ${lastTest}`);
 
   return parts.length ? `Progress so far: ${parts.join("; ")}` : "";
@@ -513,11 +494,7 @@ function indexSteps(steps: HistoryStep[]): Map<number, HistoryStep> {
   return map;
 }
 
-function findLaterWrite(
-  steps: HistoryStep[],
-  afterStep: number,
-  path: string,
-): HistoryStep | null {
+function findLaterWrite(steps: HistoryStep[], afterStep: number, path: string): HistoryStep | null {
   for (const step of steps) {
     if (
       step.step > afterStep &&
@@ -531,11 +508,7 @@ function findLaterWrite(
   return null;
 }
 
-function findLaterRead(
-  steps: HistoryStep[],
-  afterStep: number,
-  path: string,
-): HistoryStep | null {
+function findLaterRead(steps: HistoryStep[], afterStep: number, path: string): HistoryStep | null {
   for (const step of steps) {
     if (
       step.step > afterStep &&
@@ -568,9 +541,7 @@ function isEditHealed(steps: HistoryStep[], afterStep: number): boolean {
 // ---------------------------------------------------------------
 
 function isTestCommand(command: string): boolean {
-  return /\b(test|vitest|jest|pytest|npm test|pnpm test|yarn test)\b/i.test(
-    command,
-  );
+  return /\b(test|vitest|jest|pytest|npm test|pnpm test|yarn test)\b/i.test(command);
 }
 
 function stripToolResultPrefix(text: string): string {

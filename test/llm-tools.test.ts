@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  normalizeGeminiResponse,
-  OpenAICompatibleProvider,
-} from "../src/llm.js";
+import { normalizeGeminiResponse, OpenAICompatibleProvider } from "../src/llm.js";
 import { TOOL_DEFINITIONS } from "../src/tool-contract.js";
 
 const provider = new OpenAICompatibleProvider(
@@ -41,36 +38,45 @@ test("sends native function schemas and normalizes returned calls", async () => 
   globalThis.fetch = (async (_input, init) => {
     requestBody = JSON.parse(String(init?.body));
     return response({
-      choices: [{
-        message: {
-          tool_calls: [{
-            function: {
-              name: "run_bash",
-              arguments: '{"command":"npm test"}',
-            },
-          }],
+      choices: [
+        {
+          message: {
+            tool_calls: [
+              {
+                function: {
+                  name: "run_bash",
+                  arguments: '{"command":"npm test"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
         },
-        finish_reason: "tool_calls",
-      }],
+      ],
       usage: { prompt_tokens: 12, completion_tokens: 4 },
     });
   }) as typeof fetch;
 
   try {
-    const result = await provider.complete({
-      systemPrompt: "Use a declared function.",
-      history: [{ role: "user", content: "Run tests." }],
-      jsonMode: true,
-      tools: TOOL_DEFINITIONS,
-    }, 0);
+    const result = await provider.complete(
+      {
+        systemPrompt: "Use a declared function.",
+        history: [{ role: "user", content: "Run tests." }],
+        jsonMode: true,
+        tools: TOOL_DEFINITIONS,
+      },
+      0,
+    );
 
     assert.equal(requestBody?.tool_choice, "required");
     assert.equal(requestBody?.tools.length, TOOL_DEFINITIONS.length);
     assert.equal(requestBody?.tools[0].type, "function");
-    assert.deepEqual(result.toolCalls, [{
-      name: "run_bash",
-      arguments: { command: "npm test" },
-    }]);
+    assert.deepEqual(result.toolCalls, [
+      {
+        name: "run_bash",
+        arguments: { command: "npm test" },
+      },
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -86,18 +92,23 @@ test("retries once in text mode only when tool calls are unsupported", async () 
       return response({ error: { message: "tool_choice is unsupported" } }, 400);
     }
     return response({
-      choices: [{ message: { content: '{"tool":"finish","args":{"summary":"ok","status":"done"}}' } }],
+      choices: [
+        { message: { content: '{"tool":"finish","args":{"summary":"ok","status":"done"}}' } },
+      ],
       usage: {},
     });
   }) as typeof fetch;
 
   try {
-    const result = await provider.complete({
-      systemPrompt: "Use a function, or a JSON envelope when tools are unavailable.",
-      history: [{ role: "user", content: "Finish." }],
-      jsonMode: true,
-      tools: TOOL_DEFINITIONS,
-    }, 0);
+    const result = await provider.complete(
+      {
+        systemPrompt: "Use a function, or a JSON envelope when tools are unavailable.",
+        history: [{ role: "user", content: "Finish." }],
+        jsonMode: true,
+        tools: TOOL_DEFINITIONS,
+      },
+      0,
+    );
 
     assert.equal(requestBodies.length, 2);
     assert.ok(requestBodies[0].tools);
@@ -118,11 +129,14 @@ test("does not send tools on raw file-content turns", async () => {
   }) as typeof fetch;
 
   try {
-    await provider.complete({
-      systemPrompt: "Return raw file bytes.",
-      history: [{ role: "user", content: "Write file." }],
-      jsonMode: false,
-    }, 0);
+    await provider.complete(
+      {
+        systemPrompt: "Return raw file bytes.",
+        history: [{ role: "user", content: "Write file." }],
+        jsonMode: false,
+      },
+      0,
+    );
     assert.equal("tools" in (requestBody ?? {}), false);
     assert.equal("tool_choice" in (requestBody ?? {}), false);
   } finally {

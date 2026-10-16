@@ -107,9 +107,7 @@ test("buildReviewPrompt warns about same-provider review", () => {
 // ---------------------------------------------------------------
 
 test("parseReviewResponse accepts clean JSON", () => {
-  const verdict = parseReviewResponse(
-    '{"verdict":"pass","issues":[]}',
-  );
+  const verdict = parseReviewResponse('{"verdict":"pass","issues":[]}');
   assert.deepEqual(verdict, { verdict: "pass", issues: [] });
 });
 
@@ -122,9 +120,7 @@ test("parseReviewResponse accepts fenced JSON", () => {
 });
 
 test("parseReviewResponse extracts JSON from prose", () => {
-  const verdict = parseReviewResponse(
-    'Here is my review: {"verdict":"pass","issues":[]} — done.',
-  );
+  const verdict = parseReviewResponse('Here is my review: {"verdict":"pass","issues":[]} — done.');
   assert.equal(verdict?.verdict, "pass");
 });
 
@@ -140,9 +136,7 @@ test("parseReviewResponse caps the issue list", () => {
     severity: "low",
     note: "n",
   }));
-  const verdict = parseReviewResponse(
-    JSON.stringify({ verdict: "concerns", issues }),
-  );
+  const verdict = parseReviewResponse(JSON.stringify({ verdict: "concerns", issues }));
   assert.equal(verdict?.issues.length, 10);
 });
 
@@ -176,9 +170,7 @@ test("parseReviewResponse upgrades pass to concerns when issues exist", () => {
 // ---------------------------------------------------------------
 
 test("mergeIssues prioritizes harness issues and dedupes", () => {
-  const harness: ReviewIssue[] = [
-    { file: "(tests)", severity: "high", note: "exit 1" },
-  ];
+  const harness: ReviewIssue[] = [{ file: "(tests)", severity: "high", note: "exit 1" }];
   const reviewer: ReviewIssue[] = [
     { file: "(tests)", severity: "low", note: "exit 1" },
     { file: "a.ts", severity: "medium", note: "scope" },
@@ -189,14 +181,8 @@ test("mergeIssues prioritizes harness issues and dedupes", () => {
 });
 
 test("hasActionableIssue ignores low-only sets", () => {
-  assert.equal(
-    hasActionableIssue([{ file: "a", severity: "low", note: "x" }]),
-    false,
-  );
-  assert.equal(
-    hasActionableIssue([{ file: "a", severity: "medium", note: "x" }]),
-    true,
-  );
+  assert.equal(hasActionableIssue([{ file: "a", severity: "low", note: "x" }]), false);
+  assert.equal(hasActionableIssue([{ file: "a", severity: "medium", note: "x" }]), true);
   assert.equal(hasActionableIssue([]), false);
 });
 
@@ -270,16 +256,11 @@ test("reviewConcernsStatusLine says fix attempted or skipped", () => {
     reviewConcernsStatusLine({ fixRoundAttempted: true, issues }),
     /1 issue; fix round attempted/,
   );
-  assert.match(
-    reviewConcernsStatusLine({ fixRoundAttempted: false, issues }),
-    /fix round skipped/,
-  );
+  assert.match(reviewConcernsStatusLine({ fixRoundAttempted: false, issues }), /fix round skipped/);
 });
 
 test("formatIssuesTable escapes pipes and newlines", () => {
-  const table = formatIssuesTable([
-    { file: "a|b.ts", severity: "high", note: "line1\nline2" },
-  ]);
+  const table = formatIssuesTable([{ file: "a|b.ts", severity: "high", note: "line1\nline2" }]);
   assert.match(table, /a\\\|b\.ts/);
   assert.match(table, /line1 line2/);
 });
@@ -295,9 +276,7 @@ test("truncateDiff keeps short diffs intact", () => {
 
 test("truncateDiff truncates per file", () => {
   const big = "x".repeat(500);
-  const diff =
-    `diff --git a/a b/a\n${big}\n` +
-    `diff --git a/b b/b\nsmall\n`;
+  const diff = `diff --git a/a b/a\n${big}\n` + `diff --git a/b b/b\nsmall\n`;
   const out = truncateDiff(diff, 100, 5000);
   assert.match(out, /file diff truncated/);
   assert.match(out, /diff --git a\/b b\/b/);
@@ -314,9 +293,7 @@ test("filesFromDiff extracts unique paths in order", () => {
 });
 
 test("pickTestCommand strips shell chaining from a matching command", () => {
-  const steps = [
-    { tool: "run_bash", args: { command: "pnpm test && git status && git diff" } },
-  ];
+  const steps = [{ tool: "run_bash", args: { command: "pnpm test && git status && git diff" } }];
   assert.equal(pickTestCommand(steps, null), "pnpm test");
 });
 
@@ -324,23 +301,16 @@ test("pickTestCommand keeps leading cd segments", () => {
   const steps = [
     { tool: "run_bash", args: { command: "cd packages/foo && pnpm test --watch=false" } },
   ];
-  assert.equal(
-    pickTestCommand(steps, null),
-    "cd packages/foo && pnpm test --watch=false",
-  );
+  assert.equal(pickTestCommand(steps, null), "cd packages/foo && pnpm test --watch=false");
 });
 
 test("pickTestCommand handles pipes", () => {
-  const steps = [
-    { tool: "run_bash", args: { command: "npx jest 2>&1 | tail -30" } },
-  ];
+  const steps = [{ tool: "run_bash", args: { command: "npx jest 2>&1 | tail -30" } }];
   assert.equal(pickTestCommand(steps, null), "npx jest 2>&1");
 });
 
 test("pickTestCommand finds the test segment among unrelated ones", () => {
-  const steps = [
-    { tool: "run_bash", args: { command: "ls && pnpm install && pnpm test" } },
-  ];
+  const steps = [{ tool: "run_bash", args: { command: "ls && pnpm install && pnpm test" } }];
   assert.equal(pickTestCommand(steps, null), "pnpm test");
 });
 
@@ -367,58 +337,30 @@ test("scanDiffForIssues flags console.log on an added source line", () => {
 });
 
 test("scanDiffForIssues skips console.log in test files", () => {
-  const diff = [
-    "+++ b/src/foo.test.js",
-    "@@ -1,1 +1,2 @@",
-    "+console.log('expected');",
-  ].join("\n");
+  const diff = ["+++ b/src/foo.test.js", "@@ -1,1 +1,2 @@", "+console.log('expected');"].join("\n");
   assert.equal(scanDiffForIssues(diff, "").issues.length, 0);
 });
 
 test("scanDiffForIssues skips console.log in bin/ paths", () => {
-  const diff = [
-    "+++ b/bin/zorx.js",
-    "@@ -1,1 +1,2 @@",
-    "+console.log('starting');",
-  ].join("\n");
+  const diff = ["+++ b/bin/zorx.js", "@@ -1,1 +1,2 @@", "+console.log('starting');"].join("\n");
   assert.equal(scanDiffForIssues(diff, "").issues.length, 0);
 });
 
 test("scanDiffForIssues skips when the task names the file", () => {
-  const diff = [
-    "+++ b/src/index.js",
-    "@@ -1,1 +1,2 @@",
-    "+console.log('loaded');",
-  ].join("\n");
-  assert.equal(
-    scanDiffForIssues(diff, "Add a console.log to src/index.js").issues.length,
-    0,
-  );
+  const diff = ["+++ b/src/index.js", "@@ -1,1 +1,2 @@", "+console.log('loaded');"].join("\n");
+  assert.equal(scanDiffForIssues(diff, "Add a console.log to src/index.js").issues.length, 0);
 });
 
 test("scanDiffForIssues flags debugger and TODO", () => {
-  const diff = [
-    "+++ b/src/a.js",
-    "@@ -1,1 +1,3 @@",
-    "+debugger;",
-    "+// TODO: fix this",
-  ].join("\n");
+  const diff = ["+++ b/src/a.js", "@@ -1,1 +1,3 @@", "+debugger;", "+// TODO: fix this"].join("\n");
   const result = scanDiffForIssues(diff, "");
   assert.equal(result.issues.length, 2);
   assert.ok(result.issues.every((i) => i.severity === "low"));
 });
 
 test("scanDiffForIssues skips markdown and lockfiles", () => {
-  const md = [
-    "+++ b/README.md",
-    "@@ -1,1 +1,2 @@",
-    "+console.log('docs');",
-  ].join("\n");
-  const lock = [
-    "+++ b/pnpm-lock.yaml",
-    "@@ -1,1 +1,2 @@",
-    "+console.log('lock');",
-  ].join("\n");
+  const md = ["+++ b/README.md", "@@ -1,1 +1,2 @@", "+console.log('docs');"].join("\n");
+  const lock = ["+++ b/pnpm-lock.yaml", "@@ -1,1 +1,2 @@", "+console.log('lock');"].join("\n");
   assert.equal(scanDiffForIssues(md, "").issues.length, 0);
   assert.equal(scanDiffForIssues(lock, "").issues.length, 0);
 });
@@ -455,11 +397,7 @@ test("scanDiffForIssues detects a GitHub token", () => {
 });
 
 test("scanDiffForIssues detects a private key header", () => {
-  const diff = [
-    "+++ b/key.pem",
-    "@@ -1,1 +1,2 @@",
-    "+-----BEGIN RSA PRIVATE KEY-----",
-  ].join("\n");
+  const diff = ["+++ b/key.pem", "@@ -1,1 +1,2 @@", "+-----BEGIN RSA PRIVATE KEY-----"].join("\n");
   assert.equal(scanDiffForIssues(diff, "").secrets.length, 1);
 });
 
@@ -495,12 +433,7 @@ test("scanDiffForIssues redacts the secret in its note", () => {
 });
 
 test("scanDiffForIssues reports a plausible line number", () => {
-  const diff = [
-    "+++ b/src/a.js",
-    "@@ -5,2 +5,3 @@",
-    " existing",
-    "+console.log('x');",
-  ].join("\n");
+  const diff = ["+++ b/src/a.js", "@@ -5,2 +5,3 @@", " existing", "+console.log('x');"].join("\n");
   const result = scanDiffForIssues(diff, "");
   assert.match(result.issues[0].note, /line 6/);
 });

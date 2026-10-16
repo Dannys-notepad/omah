@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Lockfiles
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Hand-written prose, not code
+prompts/
+*.md
+
+# Test fixtures and shell scripts
+test/*.sh
+test/*.json
+
+# Config to skip for now
+.github/
+.omahignore.default

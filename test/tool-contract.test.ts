@@ -35,24 +35,18 @@ test("accepts one Poolside call in prose but rejects ambiguity", () => {
   const call = '{"tool":"read_file","args":{"path":"README.md"}}';
   assert.equal(parseToolCall(`<tool_call>${call}</tool_call>`, "poolside").kind, "call");
   assert.equal(parseToolCall(`Result: ${call}`, "poolside").kind, "call");
-  assert.deepEqual(
-    parseToolCall(`Example: ${call}\nActual: ${call}`, "poolside"),
-    { kind: "invalid", message: "multiple possible tool calls; reply with exactly one" },
-  );
+  assert.deepEqual(parseToolCall(`Example: ${call}\nActual: ${call}`, "poolside"), {
+    kind: "invalid",
+    message: "multiple possible tool calls; reply with exactly one",
+  });
   assert.equal(parseToolCall(`Result: ${call}`, "groq").kind, "none");
 });
 
 test("rejects missing, wrongly typed, and extra tool arguments", () => {
   assert.equal(validateToolCall("read_file", {}).kind, "invalid");
   assert.equal(validateToolCall("run_bash", { command: 4 }).kind, "invalid");
-  assert.equal(
-    validateToolCall("read_file", { path: "README.md", extra: true }).kind,
-    "invalid",
-  );
-  assert.equal(
-    validateToolCall("finish", { summary: "done", status: "success" }).kind,
-    "invalid",
-  );
+  assert.equal(validateToolCall("read_file", { path: "README.md", extra: true }).kind, "invalid");
+  assert.equal(validateToolCall("finish", { summary: "done", status: "success" }).kind, "invalid");
 });
 
 test("validates native calls against the same schema", () => {
@@ -70,10 +64,7 @@ test("validates native calls against the same schema", () => {
 });
 
 test("does not treat raw file content as a tool call", () => {
-  assert.equal(
-    parseToolCall("const answer = 42;\n<<<OMAH_END>>>", "poolside").kind,
-    "none",
-  );
+  assert.equal(parseToolCall("const answer = 42;\n<<<OMAH_END>>>", "poolside").kind, "none");
   assert.equal(TOOL_DEFINITIONS.length, 5);
   assert.ok(TOOL_DEFINITIONS.every((tool) => tool.parameters.additionalProperties === false));
 });

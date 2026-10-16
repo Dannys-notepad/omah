@@ -30,8 +30,7 @@ const OMAH_REPO = META_REPO;
 const TASK_PATTERN = /^omah\/[a-z0-9-]+$/;
 const STATE_PATTERN = /^omah-state\/omah-[a-z0-9-]+$/;
 
-const DRY_RUN =
-  (process.env.DRY_RUN || "").trim().toLowerCase() === "true";
+const DRY_RUN = (process.env.DRY_RUN || "").trim().toLowerCase() === "true";
 
 // ---------------------------------------------------------------
 // Types
@@ -67,9 +66,7 @@ async function main(): Promise<void> {
   if (manual) {
     const confirm = (process.env.INPUT_CONFIRM || "").trim();
     if (confirm !== "DELETE") {
-      await log(
-        `manual trigger requires confirm=DELETE (got "${confirm}"); refusing`,
-      );
+      await log(`manual trigger requires confirm=DELETE (got "${confirm}"); refusing`);
       process.exitCode = 1;
       return;
     }
@@ -107,9 +104,7 @@ async function main(): Promise<void> {
     } else {
       scope = repos;
     }
-    await log(
-      `MANUAL DELETE-ALL across ${scope.length} repo(s): ${scope.join(", ")}`,
-    );
+    await log(`MANUAL DELETE-ALL across ${scope.length} repo(s): ${scope.join(", ")}`);
     await log(
       "NOTE: this closes every open Omah PR in scope, including blocked drafts awaiting resume.",
     );
@@ -139,12 +134,8 @@ async function main(): Promise<void> {
       }
     } catch (err: any) {
       hadErrors = true;
-      await log(
-        `repo ${repo} failed: ${String(err?.message ?? err).slice(0, 200)}`,
-      );
-      summary.push(
-        `### ${repo}\n\n- FAILED: ${String(err?.message ?? err).slice(0, 200)}`,
-      );
+      await log(`repo ${repo} failed: ${String(err?.message ?? err).slice(0, 200)}`);
+      summary.push(`### ${repo}\n\n- FAILED: ${String(err?.message ?? err).slice(0, 200)}`);
     }
   }
 
@@ -163,11 +154,7 @@ interface RepoResult {
   errors: string[];
 }
 
-async function processRepo(
-  repo: string,
-  appJwt: string,
-  manual: boolean,
-): Promise<RepoResult> {
+async function processRepo(repo: string, appJwt: string, manual: boolean): Promise<RepoResult> {
   await log(`=== ${repo} ===`);
   const token = await mintToken(appJwt, repo);
   console.log(`::add-mask::${token}`);
@@ -220,11 +207,7 @@ function api(path: string): string {
   return `https://api.github.com${path}`;
 }
 
-async function ghJson(
-  method: string,
-  urlPath: string,
-  token: string,
-): Promise<any> {
+async function ghJson(method: string, urlPath: string, token: string): Promise<any> {
   const res = await fetch(api(urlPath), {
     method,
     headers: {
@@ -236,9 +219,7 @@ async function ghJson(
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(
-      `github ${method} ${urlPath}: ${res.status} ${text.slice(0, 200)}`,
-    );
+    throw new Error(`github ${method} ${urlPath}: ${res.status} ${text.slice(0, 200)}`);
   }
   return res.status === 204 ? null : res.json();
 }
@@ -320,19 +301,15 @@ async function fillLastCommitAt(
     if (!task) continue;
     if (prHeads.has(task)) continue; // has a PR; Rule 3 won't fire
 
-    const ref: any = await ghJson(
-      "GET",
-      `/repos/${repo}/git/ref/heads/${b.name}`,
-      token,
-    ).catch(() => null);
+    const ref: any = await ghJson("GET", `/repos/${repo}/git/ref/heads/${b.name}`, token).catch(
+      () => null,
+    );
     const sha = ref?.object?.sha;
     if (!sha) continue;
 
-    const commit: any = await ghJson(
-      "GET",
-      `/repos/${repo}/git/commits/${sha}`,
-      token,
-    ).catch(() => null);
+    const commit: any = await ghJson("GET", `/repos/${repo}/git/commits/${sha}`, token).catch(
+      () => null,
+    );
     const date = commit?.committer?.date || commit?.author?.date;
     if (date) b.lastCommitAt = String(date);
   }
@@ -343,25 +320,18 @@ async function fillLastCommitAt(
  * Returns true on success, false on any failure.
  * Only a confirmed 404 (branch really gone) counts as success.
  */
-async function deleteBranch(
-  repo: string,
-  branch: string,
-  token: string,
-): Promise<boolean> {
+async function deleteBranch(repo: string, branch: string, token: string): Promise<boolean> {
   if (branch === META_BRANCH) return false;
   if (!TASK_PATTERN.test(branch) && !STATE_PATTERN.test(branch)) return false;
 
-  const res = await fetch(
-    api(`/repos/${repo}/git/refs/heads/${branch}`),
-    {
-      method: "DELETE",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
+  const res = await fetch(api(`/repos/${repo}/git/refs/heads/${branch}`), {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
     },
-  );
+  });
 
   if (res.ok || res.status === 204) return true;
 
@@ -391,10 +361,7 @@ async function isOmahRunning(token: string): Promise<boolean> {
       `/repos/${OMAH_REPO}/actions/workflows/omah.yml/runs?status=in_progress&per_page=1`,
       token,
     );
-    if (
-      Array.isArray(inProgress?.workflow_runs) &&
-      inProgress.workflow_runs.length > 0
-    ) {
+    if (Array.isArray(inProgress?.workflow_runs) && inProgress.workflow_runs.length > 0) {
       return true;
     }
     const queued: any = await ghJson(
@@ -404,9 +371,7 @@ async function isOmahRunning(token: string): Promise<boolean> {
     );
     return Array.isArray(queued?.workflow_runs) && queued.workflow_runs.length > 0;
   } catch (err: any) {
-    await log(
-      `could not check omah.yml status: ${String(err?.message ?? err).slice(0, 200)}`,
-    );
+    await log(`could not check omah.yml status: ${String(err?.message ?? err).slice(0, 200)}`);
     return true; // fail closed
   }
 }
@@ -426,9 +391,7 @@ async function loadRepoList(token: string): Promise<string[]> {
       { cwd: tmp, env },
     );
     if (r.code !== 0) {
-      await log(
-        `repositories.json not found (${r.stderr.split("\n")[0] || "clone failed"})`,
-      );
+      await log(`repositories.json not found (${r.stderr.split("\n")[0] || "clone failed"})`);
       return [];
     }
     const raw = await fs.readFile(path.join(tmp, REPOS_FILE), "utf8");
@@ -439,9 +402,7 @@ async function loadRepoList(token: string): Promise<string[]> {
     }
     return parsed.repos.filter((r) => typeof r === "string" && r);
   } catch (err: any) {
-    await log(
-      `repositories.json load failed: ${String(err?.message ?? err).slice(0, 200)}`,
-    );
+    await log(`repositories.json load failed: ${String(err?.message ?? err).slice(0, 200)}`);
     return [];
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
@@ -452,15 +413,11 @@ async function loadRepoList(token: string): Promise<string[]> {
 // App token / JWT
 // ---------------------------------------------------------------
 
-async function signAppJwt(
-  appId: string,
-  privateKeyPem: string,
-): Promise<string> {
+async function signAppJwt(appId: string, privateKeyPem: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
   const payload = { iat: now - 60, exp: now + 9 * 60, iss: appId };
-  const b64 = (obj: unknown) =>
-    Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const b64 = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const unsigned = `${b64(header)}.${b64(payload)}`;
   const signer = createSign("RSA-SHA256");
   signer.update(unsigned);
@@ -471,15 +428,12 @@ async function signAppJwt(
 
 async function mintToken(jwt: string, repo: string): Promise<string> {
   const [owner, name] = repo.split("/");
-  const instRes = await fetch(
-    `https://api.github.com/repos/${owner}/${name}/installation`,
-    {
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/vnd.github+json",
-      },
+  const instRes = await fetch(`https://api.github.com/repos/${owner}/${name}/installation`, {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: "application/vnd.github+json",
     },
-  );
+  });
   if (!instRes.ok) {
     throw new Error(`no installation for ${repo}: ${instRes.status}`);
   }
@@ -501,9 +455,7 @@ async function mintToken(jwt: string, repo: string): Promise<string> {
   );
   if (!tokenRes.ok) {
     const text = await tokenRes.text();
-    throw new Error(
-      `could not mint token for ${repo}: ${tokenRes.status} ${text}`,
-    );
+    throw new Error(`could not mint token for ${repo}: ${tokenRes.status} ${text}`);
   }
   const token: any = await tokenRes.json();
   return token.token;

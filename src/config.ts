@@ -21,16 +21,8 @@ export const RETRYABLE_KEY_COOLDOWN_MS = 30 * 1000;
 
 export const OMAH_ROOT = "/tmp/omah";
 export const WORKSPACE = path.join(OMAH_ROOT, "workspace");
-export const SYSTEM_PROMPT_PATH = path.join(
-  process.cwd(),
-  "prompts",
-  "system.md",
-);
-export const REVIEWER_SYSTEM_PROMPT_PATH = path.join(
-  process.cwd(),
-  "prompts",
-  "review-system.md",
-);
+export const SYSTEM_PROMPT_PATH = path.join(process.cwd(), "prompts", "system.md");
+export const REVIEWER_SYSTEM_PROMPT_PATH = path.join(process.cwd(), "prompts", "review-system.md");
 export const IGNORE_FILE_PATH = path.join(process.cwd(), ".omahignore.default");
 export const AGENT_USER = "omah-runner";
 export const AGENT_HOME = `/home/${AGENT_USER}`;

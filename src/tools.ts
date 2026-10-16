@@ -6,12 +6,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { parseToolCall, type ToolName } from "./tool-contract.js";
-import type {
-  ChunkErrorCode,
-  ChunkOutcome,
-  ToolResult,
-  WriteState,
-} from "./types.js";
+import type { ChunkErrorCode, ChunkOutcome, ToolResult, WriteState } from "./types.js";
 import {
   AGENT_USER,
   AGENT_HOME,
@@ -40,11 +35,7 @@ export function cleanOutput(s: string): string {
   return s.replace(/\r\n/g, "\n").replace(ANSI_PATTERN, "");
 }
 
-export function formatBashOutput(result: {
-  stdout: string;
-  stderr: string;
-  code: number;
-}): string {
+export function formatBashOutput(result: { stdout: string; stderr: string; code: number }): string {
   return `exit ${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
 }
 
@@ -101,11 +92,7 @@ function looksLikeToolCall(raw: string): boolean {
   return parseToolCall(raw, "poolside").kind !== "none";
 }
 
-export function handleRawChunk(
-  raw: string,
-  state: WriteState,
-  filePath: string,
-): ChunkOutcome {
+export function handleRawChunk(raw: string, state: WriteState, filePath: string): ChunkOutcome {
   if (looksLikeToolCall(raw)) {
     return {
       kind: "error",
@@ -128,12 +115,11 @@ export function handleRawChunk(
     return {
       kind: "error",
       code: "MISSING_SENTINEL",
-      message:
-        containsToolMarkup
-          ? `Raw response for ${filePath} contained malformed tool-call markup instead of file contents. Nothing was written; missing ${SENTINEL_END}.`
-          : `Missing ${SENTINEL_END} line, nothing was written ` +
-            `(the reply may have been cut off). Call request_write again ` +
-            `and send the file in chunks of ~250 lines.`,
+      message: containsToolMarkup
+        ? `Raw response for ${filePath} contained malformed tool-call markup instead of file contents. Nothing was written; missing ${SENTINEL_END}.`
+        : `Missing ${SENTINEL_END} line, nothing was written ` +
+          `(the reply may have been cut off). Call request_write again ` +
+          `and send the file in chunks of ~250 lines.`,
     };
   }
   lines.pop();
@@ -183,9 +169,10 @@ export function rawWriteRetryInstruction(
     return `The chunk for ${JSON.stringify(filePath)} exceeded 200 KB. Call request_write again and split the file into smaller chunks, ending non-final chunks with ${SENTINEL_MORE}.`;
   }
 
-  const providerRule = provider === "poolside"
-    ? "Do not emit <tool_call>, <arg_key>, <arg_value>, JSON, XML, or shell commands in the raw payload."
-    : "Do not emit another tool call, JSON envelope, or explanation in the raw payload.";
+  const providerRule =
+    provider === "poolside"
+      ? "Do not emit <tool_call>, <arg_key>, <arg_value>, JSON, XML, or shell commands in the raw payload."
+      : "Do not emit another tool call, JSON envelope, or explanation in the raw payload.";
   return (
     `The raw write for ${JSON.stringify(filePath)} was rejected (${code}); no bytes were written. ` +
     `Call request_write again for the same path. When asked for contents, send only the file bytes, ` +
@@ -206,9 +193,7 @@ export async function writeAsAgentBytes(
     });
     let stderr = "";
     child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", (err) =>
-      resolve({ ok: false, output: `tee error: ${err.message}` }),
-    );
+    child.on("error", (err) => resolve({ ok: false, output: `tee error: ${err.message}` }));
     child.on("close", (code) => {
       if (code === 0) resolve({ ok: true, output: `wrote ${full}` });
       else resolve({ ok: false, output: `tee exit ${code}: ${stderr}` });
@@ -283,10 +268,7 @@ export async function runBashWithDetach(
 // Tool dispatcher
 // ---------------------------------------------------------------
 
-export async function runTool(
-  tool: ToolName,
-  args: Record<string, unknown>,
-): Promise<ToolResult> {
+export async function runTool(tool: ToolName, args: Record<string, unknown>): Promise<ToolResult> {
   switch (tool) {
     case "read_file": {
       const p = safePath(String(args.path));
@@ -320,15 +302,12 @@ export async function runTool(
     }
     case "git_commit": {
       const msg = String(args.message ?? "omah: changes");
-      const trailer = process.env.AUTHOR_NAME && process.env.AUTHOR_EMAIL
-        ? `\n\nCo-authored-by: ${process.env.AUTHOR_NAME} <${process.env.AUTHOR_EMAIL}>`
-        : "";
+      const trailer =
+        process.env.AUTHOR_NAME && process.env.AUTHOR_EMAIL
+          ? `\n\nCo-authored-by: ${process.env.AUTHOR_NAME} <${process.env.AUTHOR_EMAIL}>`
+          : "";
       await asAgent("git", ["add", "-A"]);
-      const { stdout, stderr, code } = await asAgent("git", [
-        "commit",
-        "-m",
-        msg + trailer,
-      ]);
+      const { stdout, stderr, code } = await asAgent("git", ["commit", "-m", msg + trailer]);
       if (code !== 0) return { ok: false, output: stderr };
       return { ok: true, output: stdout };
     }

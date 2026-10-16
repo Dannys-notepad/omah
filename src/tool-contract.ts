@@ -1,9 +1,4 @@
-export type ToolName =
-  | "read_file"
-  | "request_write"
-  | "run_bash"
-  | "git_commit"
-  | "finish";
+export type ToolName = "read_file" | "request_write" | "run_bash" | "git_commit" | "finish";
 
 export interface ToolCall {
   name: string;
@@ -81,9 +76,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 const TOOL_BY_NAME = new Map(TOOL_DEFINITIONS.map((tool) => [tool.name, tool]));
 
 export type ParseToolCallResult =
-  | { kind: "call"; call: ToolCall }
-  | { kind: "invalid"; message: string }
-  | { kind: "none" };
+  { kind: "call"; call: ToolCall } | { kind: "invalid"; message: string } | { kind: "none" };
 
 export function validateToolCall(name: string, args: unknown): ParseToolCallResult {
   const definition = TOOL_BY_NAME.get(name as ToolName);
@@ -121,10 +114,7 @@ export function validateToolCall(name: string, args: unknown): ParseToolCallResu
   };
 }
 
-export function parseToolCall(
-  text: string,
-  provider: string,
-): ParseToolCallResult {
+export function parseToolCall(text: string, provider: string): ParseToolCallResult {
   const raw = stripWholeCodeFence(text.trim());
   const direct = parseEnvelope(raw, provider === "poolside");
   if (direct.kind !== "none") return direct;

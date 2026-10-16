@@ -91,9 +91,7 @@ export interface KeySpec {
   key: string;
 }
 
-export function loadAllKeys(
-  log?: (msg: string) => Promise<void>,
-): KeySpec[] {
+export function loadAllKeys(log?: (msg: string) => Promise<void>): KeySpec[] {
   const disabled = new Set(
     (process.env.OMAH_DISABLED_PROVIDERS || "")
       .split(",")
@@ -120,8 +118,7 @@ export function loadAllKeys(
       continue;
     }
     if (!Array.isArray(parsed) || parsed.length === 0) {
-      if (log)
-        void log(`provider ${spec.name}: ${spec.envVar} is not a non-empty array`);
+      if (log) void log(`provider ${spec.name}: ${spec.envVar} is not a non-empty array`);
       continue;
     }
     for (const k of parsed) {
@@ -136,8 +133,7 @@ export function loadAllKeys(
   }
   if (out.length === 0) {
     throw new Error(
-      "no LLM keys loaded — set at least one of " +
-        PROVIDERS.map((p) => p.envVar).join(", "),
+      "no LLM keys loaded — set at least one of " + PROVIDERS.map((p) => p.envVar).join(", "),
     );
   }
   return out;
@@ -161,7 +157,10 @@ export function normalizeGeminiResponse(response: any): {
 }
 
 export class GeminiProvider implements LLMProvider {
-  constructor(private key: string, private model: string) {}
+  constructor(
+    private key: string,
+    private model: string,
+  ) {}
 
   async complete(req: LLMRequest, keyIndex: number): Promise<LLMResponse> {
     const ai = new GoogleGenAI({ apiKey: this.key });
@@ -293,12 +292,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const finish = choice?.finish_reason;
 
     let rawText = String(message.content ?? "");
-    if (
-      !rawText.trim() &&
-      req.jsonMode &&
-      finish !== "length" &&
-      message.reasoning
-    ) {
+    if (!rawText.trim() && req.jsonMode && finish !== "length" && message.reasoning) {
       rawText = String(message.reasoning);
     }
 
@@ -316,9 +310,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       usage: {
         input: Number(usage.prompt_tokens ?? 0),
         output: Number(usage.completion_tokens ?? 0),
-        thoughts: Number(
-          usage.completion_tokens_details?.reasoning_tokens ?? 0,
-        ),
+        thoughts: Number(usage.completion_tokens_details?.reasoning_tokens ?? 0),
         ms: elapsed,
         keyIndex,
       },
@@ -348,10 +340,13 @@ function toGeminiSchema(schema: ToolDefinition["parameters"]): Record<string, un
   return {
     type: "OBJECT",
     properties: Object.fromEntries(
-      Object.entries(schema.properties).map(([name, property]) => [name, {
-        type: "STRING",
-        ...(property.enum ? { enum: property.enum } : {}),
-      }]),
+      Object.entries(schema.properties).map(([name, property]) => [
+        name,
+        {
+          type: "STRING",
+          ...(property.enum ? { enum: property.enum } : {}),
+        },
+      ]),
     ),
     required: schema.required,
   };
@@ -389,14 +384,8 @@ interface LLMHttpError extends Error {
   retryAfterMs?: number;
 }
 
-function makeHttpError(
-  status: number,
-  body: string,
-  headers?: Headers,
-): LLMHttpError {
-  const err = new Error(
-    `HTTP ${status}: ${body.slice(0, 400)}`,
-  ) as LLMHttpError;
+function makeHttpError(status: number, body: string, headers?: Headers): LLMHttpError {
+  const err = new Error(`HTTP ${status}: ${body.slice(0, 400)}`) as LLMHttpError;
   err.status = status;
 
   if (headers) {
@@ -406,8 +395,7 @@ function makeHttpError(
       if (!Number.isNaN(seconds)) err.retryAfterMs = seconds * 1000;
       else {
         const date = Date.parse(ra);
-        if (!Number.isNaN(date))
-          err.retryAfterMs = Math.max(0, date - Date.now());
+        if (!Number.isNaN(date)) err.retryAfterMs = Math.max(0, date - Date.now());
       }
     }
   }
@@ -445,11 +433,7 @@ export function classifyError(err: unknown): LLMErrorKind {
   const msg = String(e?.message ?? e ?? "");
   if (/\b429\b|quota exceeded|rate limit exceeded/i.test(msg)) return "quota";
   if (/\b41[03]\b|\b40[134]\b/i.test(msg)) return "rotate";
-  if (
-    /\b50[0234]\b|UNAVAILABLE|high demand|overloaded|temporarily unavailable/i.test(
-      msg,
-    )
-  ) {
+  if (/\b50[0234]\b|UNAVAILABLE|high demand|overloaded|temporarily unavailable/i.test(msg)) {
     return "retryable";
   }
   if (
@@ -461,5 +445,3 @@ export function classifyError(err: unknown): LLMErrorKind {
   }
   return "fatal";
 }
-
-
