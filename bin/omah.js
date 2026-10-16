@@ -431,16 +431,22 @@ function printSummary(runs) {
   }
 
   if (successful.length > 0) {
-    const wallMs = successful.map((r) => r.wallMs || 0);
-    const llmMs = successful.map((r) => r.llmMs || 0);
-    const setupMs = successful.map((r) => r.setupMs || 0);
-    const pushMs = successful.map((r) => r.pushMs || 0);
-    console.log("Wall time per successful run (median):");
-    console.log(`  total: ${formatDuration(median(wallMs))}`);
-    console.log(`  loop:  ${formatDuration(median(llmMs))}`);
-    console.log(`  setup: ${formatDuration(median(setupMs))}`);
-    console.log(`  push:  ${formatDuration(median(pushMs))}`);
-  }
+  const wallMs = successful.map((r) => r.wallMs || 0);
+  const llmMs = successful.map((r) => r.llmMs || 0);
+  const setupMs = successful.map((r) => r.setupMs || 0);
+  const reviewMs = successful.map((r) => r.reviewMs || 0);
+  const pushMs = successful.map((r) => r.pushMs || 0);
+  const toolMs = wallMs.map((total, i) =>
+    Math.max(0, total - llmMs[i] - setupMs[i] - reviewMs[i] - pushMs[i]),
+  );
+  console.log("Wall time per successful run (median):");
+  console.log(`  total:  ${formatDuration(median(wallMs))}`);
+  console.log(`  loop:   ${formatDuration(median(llmMs))}`);
+  console.log(`  review: ${formatDuration(median(reviewMs))}`);
+  console.log(`  push:   ${formatDuration(median(pushMs))}`);
+  console.log(`  setup:  ${formatDuration(median(setupMs))}`);
+  console.log(`  tools:  ${formatDuration(median(toolMs))}`);
+}
 }
 
 function usage() {

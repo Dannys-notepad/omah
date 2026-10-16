@@ -87,6 +87,7 @@ import {
 async function main(): Promise<void> {
   const runStarted = Date.now();
   let setupMs = 0;
+  let reviewMs = 0;
   let pushMs = 0;
 
   await fs.mkdir(OMAH_ROOT, { recursive: true, mode: 0o755 });
@@ -264,6 +265,8 @@ async function main(): Promise<void> {
 
   await saveConversation(conversation, targetRepo, appToken);
 
+
+  const reviewStart = Date.now()
   if (result.status === "done" && !conversation.reviewConcerns) {
     const outcome = await runReviewGate({
       conversation,
@@ -344,6 +347,8 @@ async function main(): Promise<void> {
     }
   }
 
+  reviewMs = Date.now() - reviewStart;
+
   if (process.env.OMAH_SCRIPT) {
     try {
       await fs.writeFile("/tmp/omah-attack/pkill-ran", "1");
@@ -391,6 +396,7 @@ async function main(): Promise<void> {
     fixRoundRan,
     runStarted,
     setupMs,
+    reviewMs,
     pushMs,
     prUrl,
     pushedSha,
@@ -1102,6 +1108,7 @@ async function writeRunEntry(args: {
   fixRoundRan: boolean;
   runStarted: number;
   setupMs: number;
+  reviewMs: number;
   pushMs: number;
   prUrl: string;
   pushedSha?: string;
@@ -1143,6 +1150,7 @@ async function writeRunEntry(args: {
     wallMs: Date.now() - args.runStarted,
     llmMs,
     setupMs: args.setupMs,
+    reviewMs: args.reviewMs,
     pushMs: args.pushMs,
     tokensIn,
     tokensOut,

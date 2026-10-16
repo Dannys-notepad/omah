@@ -54,6 +54,7 @@ export interface RunEntry {
   wallMs: number;
   llmMs: number;
   setupMs: number;
+  reviewMs: number;
   pushMs: number;
   tokensIn: number;
   tokensOut: number;
