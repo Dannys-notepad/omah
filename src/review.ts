@@ -64,7 +64,8 @@ const ACTIONABLE_SEVERITIES: ReadonlySet<ReviewIssue["severity"]> = new Set([
 /**
  * Pick the test command for the fresh review run. Prefers the most recent
  * test command the agent ran; falls back to the package.json test script.
- * Returns null when neither exists.
+ * Strips shell chaining from the picked command so a run like
+ * `pnpm test && git status && git diff` yields just `pnpm test`.
  */
 export function pickTestCommand(
   steps: Array<{ tool: string; args: Record<string, unknown> }>,
@@ -74,12 +75,41 @@ export function pickTestCommand(
     const step = steps[i];
     if (step.tool !== "run_bash") continue;
     const command = String(step.args.command ?? "");
-    if (TEST_COMMAND_PATTERN.test(command)) return command;
+    const stripped = extractTestCommand(command);
+    if (stripped) return stripped;
   }
   if (packageJsonTestScript && packageJsonTestScript.trim()) {
-    return packageJsonTestScript;
+    return packageJsonTestScript.trim();
   }
   return null;
+}
+
+/**
+ * Extract just the test command from a possibly-chained shell command.
+ * Splits on `&&`, `||`, `;`, and `|`, finds the first segment that
+ * matches the test pattern, and keeps any leading `cd` segments so the
+ * test runs in the right directory. Returns null if no segment matches.
+ */
+function extractTestCommand(command: string): string | null {
+  const parts = command
+    .split(/\s*(?:&&|\|\||;|\|)\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  let testIndex = -1;
+  for (let i = 0; i < parts.length; i++) {
+    if (TEST_COMMAND_PATTERN.test(parts[i])) {
+      testIndex = i;
+      break;
+    }
+  }
+  if (testIndex < 0) return null;
+
+  const leading: string[] = [];
+  for (let i = 0; i < testIndex; i++) {
+    if (/^cd\s/.test(parts[i])) leading.push(parts[i]);
+  }
+  return [...leading, parts[testIndex]].join(" && ");
 }
 
 /**

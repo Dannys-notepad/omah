@@ -311,3 +311,34 @@ test("filesFromDiff extracts unique paths in order", () => {
     "diff --git a/x.ts b/x.ts\n";
   assert.deepEqual(filesFromDiff(diff), ["x.ts", "y/z.ts"]);
 });
+
+test("pickTestCommand strips shell chaining from a matching command", () => {
+  const steps = [
+    { tool: "run_bash", args: { command: "pnpm test && git status && git diff" } },
+  ];
+  assert.equal(pickTestCommand(steps, null), "pnpm test");
+});
+
+test("pickTestCommand keeps leading cd segments", () => {
+  const steps = [
+    { tool: "run_bash", args: { command: "cd packages/foo && pnpm test --watch=false" } },
+  ];
+  assert.equal(
+    pickTestCommand(steps, null),
+    "cd packages/foo && pnpm test --watch=false",
+  );
+});
+
+test("pickTestCommand handles pipes", () => {
+  const steps = [
+    { tool: "run_bash", args: { command: "npx jest 2>&1 | tail -30" } },
+  ];
+  assert.equal(pickTestCommand(steps, null), "npx jest 2>&1");
+});
+
+test("pickTestCommand finds the test segment among unrelated ones", () => {
+  const steps = [
+    { tool: "run_bash", args: { command: "ls && pnpm install && pnpm test" } },
+  ];
+  assert.equal(pickTestCommand(steps, null), "pnpm test");
+});
