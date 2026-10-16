@@ -750,6 +750,11 @@ try {
 );
 const fileList = filesFromDiff(diff);
 
+await log(
+  `[review] diff: ${Buffer.byteLength(diff, "utf8")} bytes, ` +
+    `${fileList.length} file(s)${fileList.length > 0 ? ": " + fileList.join(", ") : ""}`,
+);
+
 if (diff.trim().length === 0) {
   return skip("empty diff");
 }
