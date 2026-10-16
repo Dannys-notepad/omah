@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { runLoop, type RunLoopArgs } from "../src/loop.js";
 import {
   handleRawChunk,
   rawWriteRetryInstruction,
-  runLoop,
-} from "../agent.js";
-import type { ConversationStep, RunLoopArgs } from "../agent.js";
+} from "../src/tools.js";
+import type { ConversationStep } from "../src/types.js";
 
 function createArgs(): RunLoopArgs {
   return {
