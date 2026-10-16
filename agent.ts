@@ -79,9 +79,10 @@ const RETRYABLE_KEY_COOLDOWN_MS = 30 * 1000;
 
 const OMAH_ROOT = "/tmp/omah";
 const WORKSPACE = path.join(OMAH_ROOT, "workspace");
-const SYSTEM_PROMPT_PATH = path.join(process.cwd(), "system.md");
+const SYSTEM_PROMPT_PATH = path.join(process.cwd(), "prompts", "system.md");
 const REVIEWER_SYSTEM_PROMPT_PATH = path.join(
   process.cwd(),
+  "prompts",
   "review-system.md",
 );
 const IGNORE_FILE_PATH = path.join(process.cwd(), ".omahignore.default");
