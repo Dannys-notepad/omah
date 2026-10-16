@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { runLoop, type RunLoopArgs } from "../src/loop.js";
-import {
-  handleRawChunk,
-  rawWriteRetryInstruction,
-} from "../src/tools.js";
+import { handleRawChunk, rawWriteRetryInstruction } from "../src/tools.js";
 import type { ConversationStep } from "../src/types.js";
 
 function createArgs(): RunLoopArgs {
@@ -62,7 +59,8 @@ test("blocks after three malformed model replies", async () => {
 });
 
 test("diagnoses malformed Poolside tool markup in raw-write replies", () => {
-  const raw = '{"reasoning":"","tool":"run_bash<arg_key>command</arg_key><arg_value>pnpm test</arg_value></tool_call>}';
+  const raw =
+    '{"reasoning":"","tool":"run_bash<arg_key>command</arg_key><arg_value>pnpm test</arg_value></tool_call>}';
   const outcome = handleRawChunk(
     raw,
     { path: "src/lib/core/createProject.js", chunks: [], bytesTotal: 0 },
@@ -84,15 +82,21 @@ test("dispatches one normalized native tool call", async () => {
     maxRuntimeMs: 10_000,
     callModel: async () => ({
       text: "",
-      toolCalls: [{
-        name: "finish",
-        arguments: { summary: "Completed", status: "done" },
-      }],
+      toolCalls: [
+        {
+          name: "finish",
+          arguments: { summary: "Completed", status: "done" },
+        },
+      ],
       usage: { input: 0, output: 0, thoughts: 0, ms: 0, keyIndex: 0 },
     }),
   });
 
-  assert.deepEqual(result, { summary: "Completed", status: "done" });
+  assert.deepEqual(result, {
+    summary: "Completed",
+    status: "done",
+    compressionsDone: 0,
+  });
   assert.equal(args.conversation.steps[0].tool, "finish");
 });
 
@@ -156,7 +160,11 @@ test("continues rotating keys when provider quotas are not configured as shared"
   });
 
   assert.equal(calls, 2);
-  assert.deepEqual(result, { summary: "ok", status: "done" });
+  assert.deepEqual(result, {
+    summary: "ok",
+    status: "done",
+    compressionsDone: 0,
+  });
 });
 
 test("blocks when a provider never responds within the run budget", async () => {

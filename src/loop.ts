@@ -10,11 +10,7 @@ import {
   type LLMProvider,
   type LLMMessage,
 } from "./llm.js";
-import {
-  fingerprint,
-  isPerDayLimit,
-  resetTimeFor,
-} from "./keystate.js";
+import { fingerprint, isPerDayLimit, resetTimeFor } from "./keystate.js";
 import {
   parseToolCall,
   TOOL_DEFINITIONS,
@@ -23,10 +19,7 @@ import {
   type ToolCall,
   type ToolName,
 } from "./tool-contract.js";
-import {
-  compressHistory,
-  MIN_STEPS_BETWEEN,
-} from "./history.js";
+import { compressHistory, MIN_STEPS_BETWEEN } from "./history.js";
 import type {
   Conversation,
   ConversationStep,
@@ -90,6 +83,7 @@ export interface RunLoopArgs {
 export interface RunLoopResult {
   summary: string;
   status: "done" | "blocked";
+  compressionsDone: number;
 }
 
 export interface RunLoopOptions {
@@ -107,10 +101,7 @@ class RunBudgetExceededError extends Error {}
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new RunBudgetExceededError()),
-      Math.max(0, timeoutMs),
-    );
+    const timer = setTimeout(() => reject(new RunBudgetExceededError()), Math.max(0, timeoutMs));
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -127,10 +118,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 function recordStep(
   conversation: Conversation,
   entry: Omit<ConversationStep, "step" | "at"> & { at?: string },
-  digest?: Pick<
-    ToolResult,
-    "exitCode" | "keyLines" | "keyLinesTotal" | "testSummary"
-  >,
+  digest?: Pick<ToolResult, "exitCode" | "keyLines" | "keyLinesTotal" | "testSummary">,
   measure = false,
 ): number {
   const stepNumber = conversation.steps.length + 1;
@@ -211,9 +199,7 @@ async function callModel(
       };
     }
     const reply = scriptedResponses[scriptedIndex++];
-    await log(
-      `OMAH_SCRIPT: returning response ${scriptedIndex}/${scriptedResponses.length}`,
-    );
+    await log(`OMAH_SCRIPT: returning response ${scriptedIndex}/${scriptedResponses.length}`);
     return {
       text: reply,
       usage: { input: 0, output: 0, thoughts: 0, ms: 0, keyIndex },
@@ -238,9 +224,7 @@ async function callModel(
         keyIndex,
       );
       recordKeyCall(keyIndex);
-      setLastUsedProvider(
-        provider.constructor.name === "GeminiProvider" ? "gemini" : null,
-      );
+      setLastUsedProvider(provider.constructor.name === "GeminiProvider" ? "gemini" : null);
       return {
         text: result.text,
         toolCalls: result.toolCalls,
@@ -254,9 +238,7 @@ async function callModel(
       if (kind === "quota") {
         const s = keyStats.get(keyIndex);
         if (!s || s.rate429 === 0) {
-          await log(
-            `key ${keyIndex + 1} 429 (full message): ${String(err?.message ?? err)}`,
-          );
+          await log(`key ${keyIndex + 1} 429 (full message): ${String(err?.message ?? err)}`);
         }
         recordKeyRateLimit(keyIndex, String(err?.message ?? err));
         throw err;
@@ -304,27 +286,21 @@ export async function runLoop(
   const startedAt = Date.now();
   const maxRuntimeMs = options.maxRuntimeMs ?? WALL_CLOCK_MS;
   const invokeModel = options.callModel ?? callModel;
-  const cooldownUntil =
-    options.cooldownUntil ?? new Map<number, number>();
+  const cooldownUntil = options.cooldownUntil ?? new Map<number, number>();
   const sharedQuotaInput =
-    options.sharedQuotaProviders ??
-    process.env.OMAH_SHARED_QUOTA_PROVIDERS ??
-    "";
+    options.sharedQuotaProviders ?? process.env.OMAH_SHARED_QUOTA_PROVIDERS ?? "";
   const sharedQuotaList = Array.isArray(sharedQuotaInput)
     ? sharedQuotaInput
     : String(sharedQuotaInput).split(",");
   const sharedQuotaProviders = new Set(
-    sharedQuotaList
-      .map((provider) => provider.trim().toLowerCase())
-      .filter(Boolean),
+    sharedQuotaList.map((provider) => provider.trim().toLowerCase()).filter(Boolean),
   );
   const history: Message[] = [];
   let consecutiveErrors = 0;
   let lastFailure = "";
   let keyIndex = 0;
 
-  let lastCompressAtStepCount =
-    args.conversation.steps.length > 0 ? -MIN_STEPS_BETWEEN : 0;
+  let lastCompressAtStepCount = args.conversation.steps.length > 0 ? -MIN_STEPS_BETWEEN : 0;
   let compressionsDone = 0;
 
   let writeState: WriteState | null = null;
@@ -382,6 +358,7 @@ export async function runLoop(
       return {
         summary: `Wall-clock budget exceeded after ${args.conversation.steps.length} steps.`,
         status: "blocked",
+        compressionsDone,
       };
     }
     if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -390,12 +367,12 @@ export async function runLoop(
           `Stopped after ${MAX_CONSECUTIVE_ERRORS} consecutive tool errors.` +
           (lastFailure ? ` Last failure: ${lastFailure}` : ""),
         status: "blocked",
+        compressionsDone,
       };
     }
 
     if (!writeState) {
-      const stepsSince =
-        args.conversation.steps.length - lastCompressAtStepCount;
+      const stepsSince = args.conversation.steps.length - lastCompressAtStepCount;
       if (compressionsDone < 3) {
         try {
           const compressed = compressHistory(
@@ -413,9 +390,7 @@ export async function runLoop(
             );
           }
         } catch (err: any) {
-          await log(
-            `[compress] skipped: ${String(err?.message ?? err).slice(0, 200)}`,
-          );
+          await log(`[compress] skipped: ${String(err?.message ?? err).slice(0, 200)}`);
         }
       }
     }
@@ -425,6 +400,7 @@ export async function runLoop(
       return {
         summary: "All LLM keys are exhausted for the day.",
         status: "blocked",
+        compressionsDone,
       };
     }
     if (pick.kind === "wait") {
@@ -435,6 +411,7 @@ export async function runLoop(
             `LLM key cooldown exceeds the remaining wall-clock budget after ` +
             `${args.conversation.steps.length} steps.`,
           status: "blocked",
+          compressionsDone,
         };
       }
       await log(
@@ -457,17 +434,12 @@ export async function runLoop(
       return {
         summary: `Wall-clock budget exceeded after ${args.conversation.steps.length} steps.`,
         status: "blocked",
+        compressionsDone,
       };
     }
     try {
       const result: Awaited<ReturnType<typeof invokeModel>> = await withTimeout(
-        invokeModel(
-          provider,
-          args.systemPrompt,
-          history,
-          writeState === null,
-          keyIndex,
-        ),
+        invokeModel(provider, args.systemPrompt, history, writeState === null, keyIndex),
         remainingMs,
       );
       responseText = result.text;
@@ -504,6 +476,7 @@ export async function runLoop(
             `Wall-clock budget exceeded while waiting for an LLM response ` +
             `after ${args.conversation.steps.length} steps.`,
           status: "blocked",
+          compressionsDone,
         };
       }
       const kind = classifyError(err);
@@ -513,9 +486,7 @@ export async function runLoop(
         const ks = args.keys[keyIndex];
         const sharedBucket = sharedQuotaProviders.has(ks.provider.toLowerCase());
         const affectedKeys = sharedBucket
-          ? args.keys.flatMap((key, index) =>
-              key.provider === ks.provider ? [index] : [],
-            )
+          ? args.keys.flatMap((key, index) => (key.provider === ks.provider ? [index] : []))
           : [keyIndex];
 
         if (isPerDayLimit(err)) {
@@ -569,24 +540,19 @@ export async function runLoop(
             cooldownUntil.set(i, Number.POSITIVE_INFINITY);
           }
         }
-        await log(
-          `provider ${bad} marked dead for this run [${String(errAny?.status ?? "?")}]`,
-        );
+        await log(`provider ${bad} marked dead for this run [${String(errAny?.status ?? "?")}]`);
         keyIndex = (keyIndex + 1) % args.keys.length;
         continue;
       }
 
-      const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(
-        0,
-        300,
-      );
-      const statusCode =
-        errAny?.status ?? errAny?.code ?? errAny?.response?.status;
+      const msg = String(errAny?.message ?? errAny ?? "unknown error").slice(0, 300);
+      const statusCode = errAny?.status ?? errAny?.code ?? errAny?.response?.status;
       const label = `LLM call failed (status=${statusCode ?? "unknown"})`;
       await log(`blocking: ${label}: ${msg}`);
       return {
         summary: `${label}: ${msg}`,
         status: "blocked",
+        compressionsDone,
       };
     }
 
@@ -597,8 +563,7 @@ export async function runLoop(
         lastFailure = `${writeState.path} (${outcome.code}): ${outcome.message}`;
         if (outcome.code === "TOOL_CALL_GUARD") {
           await log(
-            `guard: rejected raw write for ${writeState.path} ` +
-              `(looks like a tool call)`,
+            `guard: rejected raw write for ${writeState.path} ` + `(looks like a tool call)`,
           );
         }
         await log(`write error [${outcome.code}]: ${outcome.message}`);
@@ -615,11 +580,7 @@ export async function runLoop(
             {
               text:
                 `Tool result (error):\n${outcome.message}\n\n` +
-                rawWriteRetryInstruction(
-                  writeState.path,
-                  outcome.code,
-                  keySpec.provider,
-                ),
+                rawWriteRetryInstruction(writeState.path, outcome.code, keySpec.provider),
             },
           ],
         });
@@ -771,7 +732,7 @@ export async function runLoop(
         args: parsed.args,
         result: { ok: true, output: summary },
       });
-      return { summary, status };
+      return { summary, status, compressionsDone };
     }
 
     if (parsed.tool === "request_write") {
@@ -838,12 +799,10 @@ export async function runLoop(
       continue;
     }
 
-    const result: ToolResult = await runTool(parsed.tool, parsed.args).catch(
-      (e) => ({
-        ok: false,
-        output: String(e?.message ?? e),
-      }),
-    );
+    const result: ToolResult = await runTool(parsed.tool, parsed.args).catch((e) => ({
+      ok: false,
+      output: String(e?.message ?? e),
+    }));
 
     const isBash = parsed.tool === "run_bash";
     const historyOutput = isBash

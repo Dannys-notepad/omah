@@ -8,17 +8,9 @@ import ignore from "ignore";
 import { createSign } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  makeProvider,
-  classifyError,
-  type KeySpec,
-} from "./src/llm.js";
-import {
-  loadState,
-  saveState,
-  addRepo,
-  fingerprint,
-} from "./src/keystate.js";
+import { appendRunEntry, type RunEntry } from "./src/runlog.js";
+import { makeProvider, classifyError, type KeySpec } from "./src/llm.js";
+import { loadState, saveState, addRepo, fingerprint } from "./src/keystate.js";
 import {
   buildFixRoundMessage,
   buildReviewPrompt,
@@ -72,14 +64,8 @@ import {
   asAgentBuffer,
   gitAuthEnv,
 } from "./src/infra.js";
-import {
-  runLoop,
-  type RunLoopResult,
-} from "./src/loop.js";
-import {
-  runBashWithDetach,
-  buildBashDigest,
-} from "./src/tools.js";
+import { runLoop, type RunLoopResult } from "./src/loop.js";
+import { runBashWithDetach, buildBashDigest } from "./src/tools.js";
 import {
   usageLog,
   keyStats,
@@ -121,9 +107,7 @@ async function main(): Promise<void> {
       setMetaToken(await mintAppToken(appJwt, metaRepo));
       console.log(`::add-mask::${metaToken}`);
     } catch (e: any) {
-      await log(
-        `keystate: no meta token (${e?.message ?? e}); persistence disabled`,
-      );
+      await log(`keystate: no meta token (${e?.message ?? e}); persistence disabled`);
     }
   } else {
     await log("keystate: OMAH_META_REPO not set; persistence disabled");
@@ -146,8 +130,7 @@ async function main(): Promise<void> {
   const { appSlug } = await resolveAppIdentity(appJwt);
 
   const authorName = process.env.AUTHOR_NAME || appSlug;
-  const authorEmail =
-    process.env.AUTHOR_EMAIL || `${appSlug}[bot]@users.noreply.github.com`;
+  const authorEmail = process.env.AUTHOR_EMAIL || `${appSlug}[bot]@users.noreply.github.com`;
 
   const client = githubClient(appToken);
   const repoInfo = await getRepo(client, targetRepo);
@@ -161,12 +144,10 @@ async function main(): Promise<void> {
     branchName = requireEnv("INPUT_BRANCH");
     taskId = branchName.split("-").pop() ?? shortId();
     taskText = "";
-    baseBranch =
-      process.env.INPUT_BASE_BRANCH?.trim() || repoInfo.default_branch;
+    baseBranch = process.env.INPUT_BASE_BRANCH?.trim() || repoInfo.default_branch;
   } else {
     taskText = requireEnv("INPUT_TASK");
-    baseBranch =
-      process.env.INPUT_BASE_BRANCH?.trim() || repoInfo.default_branch;
+    baseBranch = process.env.INPUT_BASE_BRANCH?.trim() || repoInfo.default_branch;
     taskId = shortId();
     const slug = slugify(taskText).slice(0, 40);
     branchName = `omah/${slug}-${taskId}`;
@@ -231,11 +212,15 @@ async function main(): Promise<void> {
   }
 
   await log(
-    `loaded ${keys.length} keys: ` +
-      keys.map((k, i) => `${i + 1}=${k.provider}`).join(", "),
+    `loaded ${keys.length} keys: ` + keys.map((k, i) => `${i + 1}=${k.provider}`).join(", "),
   );
 
   const cooldownUntil = new Map<number, number>();
+  let reviewOutcome: "skipped" | "pass" | "concerns" = "skipped";
+  let fixRoundRan = false;
+  let reviewIssueCount = 0;
+  let pushedSha: string | undefined;
+  let pushedTree: string | undefined;
 
   const resumeText = process.env.INPUT_RESUME_TEXT?.trim() || "";
 
@@ -293,6 +278,18 @@ async function main(): Promise<void> {
     if (outcome.ran && outcome.issues.length > 0) {
       conversation.reviewIssues = outcome.issues;
     }
+
+    if (!outcome.ran) {
+      reviewOutcome = "skipped";
+    } else if (hasActionableIssue(outcome.issues)) {
+      reviewOutcome = "concerns";
+      reviewIssueCount = outcome.issues.length;
+    } else {
+      reviewOutcome = "pass";
+      reviewIssueCount = outcome.issues.length;
+    }
+    if (outcome.reenter) fixRoundRan = true;
+
     if (outcome.reenter) {
       await log("[review] re-entering loop for fix round");
       conversation.reviewConcerns = true;
@@ -333,13 +330,13 @@ async function main(): Promise<void> {
         .map((i) => i.file)
         .join(", ");
       await log(
-        `[push] refusing to push: possible secret(s) in ${names}. ` +
-          `Remove them and re-run.`,
+        `[push] refusing to push: possible secret(s) in ${names}. ` + `Remove them and re-run.`,
       );
       refuseToPush = true;
       result = {
         summary: `Refusing to push: possible secrets remain in ${names}. Remove them and re-run.`,
         status: "blocked",
+        compressionsDone: result.compressionsDone,
       };
       conversation.summary = result.summary;
       conversation.status = result.status;
@@ -360,7 +357,7 @@ async function main(): Promise<void> {
     setOutput("status", result.status);
   } else {
     const pushStart = Date.now();
-    prUrl = await pushPatchAndOpenPR({
+    const pushResult = await pushPatchAndOpenPR({
       appToken,
       targetRepo,
       baseBranch,
@@ -373,6 +370,9 @@ async function main(): Promise<void> {
       reviewConcerns: Boolean(conversation.reviewConcerns),
     });
     pushMs = Date.now() - pushStart;
+    prUrl = pushResult.url;
+    pushedSha = pushResult.sha;
+    pushedTree = pushResult.tree;
 
     if (prUrl) {
       setOutput("pr_url", prUrl);
@@ -381,6 +381,21 @@ async function main(): Promise<void> {
   }
 
   await log(`done. pr=${prUrl || "(none)"} status=${result.status}`);
+
+  await writeRunEntry({
+    conversation,
+    result,
+    keys,
+    reviewOutcome,
+    reviewIssueCount,
+    fixRoundRan,
+    runStarted,
+    setupMs,
+    pushMs,
+    prUrl,
+    pushedSha,
+    pushedTree,
+  });
 }
 
 // ---------------------------------------------------------------
@@ -405,9 +420,7 @@ interface ReviewGateOutcome {
   issues: ReviewIssue[];
 }
 
-async function runReviewGate(
-  args: ReviewGateArgs,
-): Promise<ReviewGateOutcome> {
+async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateOutcome> {
   const skip = async (reason: string): Promise<ReviewGateOutcome> => {
     await log(`[review] skipped: ${reason}`);
     return { ran: false, reenter: false, fixMessage: "", issues: [] };
@@ -415,10 +428,7 @@ async function runReviewGate(
 
   let reviewerSystemPrompt: string;
   try {
-    reviewerSystemPrompt = await fs.readFile(
-      REVIEWER_SYSTEM_PROMPT_PATH,
-      "utf8",
-    );
+    reviewerSystemPrompt = await fs.readFile(REVIEWER_SYSTEM_PROMPT_PATH, "utf8");
   } catch (err: any) {
     return skip(
       `reviewer system prompt not readable: ${String(err?.message ?? err).slice(0, 120)}`,
@@ -482,11 +492,7 @@ async function runReviewGate(
     .split(/^(?=diff --git )/m)
     .filter((chunk) => !chunk.startsWith("diff --git a/.git/"))
     .join("");
-  const diff = truncateDiff(
-    filtered,
-    REVIEW_MAX_FILE_DIFF_BYTES,
-    REVIEW_MAX_DIFF_BYTES,
-  );
+  const diff = truncateDiff(filtered, REVIEW_MAX_FILE_DIFF_BYTES, REVIEW_MAX_DIFF_BYTES);
   const fileList = filesFromDiff(diff);
 
   await log(
@@ -504,9 +510,7 @@ async function runReviewGate(
   }
   const lowCount = scan.issues.filter((i) => i.severity === "low").length;
   const highCount = scan.issues.filter((i) => i.severity === "high").length;
-  await log(
-    `[review] scan: ${highCount} secret(s) redacted, ${lowCount} debug/TODO line(s)`,
-  );
+  await log(`[review] scan: ${highCount} secret(s) redacted, ${lowCount} debug/TODO line(s)`);
 
   const prompt = buildReviewPrompt({
     task: args.conversation.taskText,
@@ -527,12 +531,9 @@ async function runReviewGate(
     prompt,
   );
   if (!call) return skip("reviewer call failed on all attempted keys");
-  const sameProviderAsWriter =
-    lastUsedProvider !== null && call.provider === lastUsedProvider;
+  const sameProviderAsWriter = lastUsedProvider !== null && call.provider === lastUsedProvider;
   if (sameProviderAsWriter) {
-    await log(
-      `[review] warning: reviewed by same provider as writer (${call.provider})`,
-    );
+    await log(`[review] warning: reviewed by same provider as writer (${call.provider})`);
   }
 
   const verdict = parseReviewResponse(call.text);
@@ -546,10 +547,7 @@ async function runReviewGate(
     testTimedOut,
     testExitCode,
   });
-  const merged = mergeIssues(verdict.issues, [
-    ...harnessIssues,
-    ...scan.issues,
-  ]);
+  const merged = mergeIssues(verdict.issues, [...harnessIssues, ...scan.issues]);
 
   await log(
     `[review] verdict=${verdict.verdict} issues=${merged.length} ` +
@@ -638,9 +636,7 @@ async function callReviewerWithRotation(
   return null;
 }
 
-async function scanWorkspaceDiffForSecrets(
-  startSha: string,
-): Promise<DiffScanResult> {
+async function scanWorkspaceDiffForSecrets(startSha: string): Promise<DiffScanResult> {
   const diffResult = await asAgentBuffer("git", [
     "diff",
     "--no-ext-diff",
@@ -711,7 +707,13 @@ interface PushArgs {
   reviewConcerns: boolean;
 }
 
-async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
+interface PushResult {
+  url: string;
+  sha?: string;
+  tree?: string;
+}
+
+async function pushPatchAndOpenPR(args: PushArgs): Promise<PushResult> {
   await asAgent("git", ["add", "-A"]);
 
   const patchResult = await asAgentBuffer("git", [
@@ -819,11 +821,10 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
   });
   if (r.code !== 0) throw new Error(`remote add failed: ${r.stderr}`);
 
-  r = await asOrchestrator(
-    "git",
-    ["fetch", "--depth", "1", "origin", args.startSha],
-    { cwd: pushClone, env: cloneEnv },
-  );
+  r = await asOrchestrator("git", ["fetch", "--depth", "1", "origin", args.startSha], {
+    cwd: pushClone,
+    env: cloneEnv,
+  });
   if (r.code !== 0) throw new Error(`fetch failed: ${r.stderr}`);
 
   r = await asOrchestrator("git", ["checkout", args.startSha], {
@@ -838,11 +839,9 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
 
   const tmpPatch = path.join(pushClone, "omah-patch.diff");
   await fs.writeFile(tmpPatch, patch);
-  const applyResult = await asOrchestrator(
-    "git",
-    ["apply", "--index", tmpPatch],
-    { cwd: pushClone },
-  );
+  const applyResult = await asOrchestrator("git", ["apply", "--index", tmpPatch], {
+    cwd: pushClone,
+  });
   await fs.rm(tmpPatch, { force: true });
 
   if (applyResult.code !== 0) {
@@ -873,6 +872,15 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
     throw new Error(`commit failed: ${commitResult.stderr}`);
   }
 
+  const shaResult = await asOrchestrator("git", ["rev-parse", "HEAD"], {
+    cwd: pushClone,
+  });
+  const treeResult = await asOrchestrator("git", ["rev-parse", "HEAD^{tree}"], {
+    cwd: pushClone,
+  });
+  const pushedSha = shaResult.code === 0 ? shaResult.stdout.trim() : undefined;
+  const pushedTree = treeResult.code === 0 ? treeResult.stdout.trim() : undefined;
+
   const pushResult = await asOrchestrator(
     "git",
     ["push", "-u", "origin", `HEAD:refs/heads/${args.branchName}`],
@@ -890,8 +898,7 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
     `/repos/${owner}/${repo}/pulls?head=${owner}:${args.branchName}&state=open`,
   );
 
-  const shouldBeDraft =
-    args.conversation.status === "blocked" || args.reviewConcerns;
+  const shouldBeDraft = args.conversation.status === "blocked" || args.reviewConcerns;
 
   let prUrl: string;
   let prNodeId: string | null = null;
@@ -919,23 +926,15 @@ async function pushPatchAndOpenPR(args: PushArgs): Promise<string> {
     prIsDraft = Boolean(created.draft);
   }
 
-  if (
-    args.conversation.status === "done" &&
-    !args.reviewConcerns &&
-    prNodeId &&
-    prIsDraft
-  ) {
+  if (args.conversation.status === "done" && !args.reviewConcerns && prNodeId && prIsDraft) {
     await markReadyForReview(args.appToken, prNodeId);
   }
 
   await fs.rm(pushClone, { recursive: true, force: true });
-  return prUrl;
+  return { url: prUrl, sha: pushedSha, tree: pushedTree };
 }
 
-async function markReadyForReview(
-  token: string,
-  nodeId: string,
-): Promise<void> {
+async function markReadyForReview(token: string, nodeId: string): Promise<void> {
   const query = `
     mutation {
       markPullRequestReadyForReview(input: { pullRequestId: "${nodeId}" }) {
@@ -956,15 +955,11 @@ async function markReadyForReview(
   try {
     json = JSON.parse(text);
   } catch {
-    await log(
-      `markReadyForReview: non-JSON response (${res.status}): ${text.slice(0, 200)}`,
-    );
+    await log(`markReadyForReview: non-JSON response (${res.status}): ${text.slice(0, 200)}`);
     return;
   }
   if (json.errors) {
-    await log(
-      `markReadyForReview failed: ${JSON.stringify(json.errors).slice(0, 200)}`,
-    );
+    await log(`markReadyForReview failed: ${JSON.stringify(json.errors).slice(0, 200)}`);
     return;
   }
   if (json?.data?.markPullRequestReadyForReview?.pullRequest?.isDraft) {
@@ -979,7 +974,7 @@ async function failStep(
   repo: string,
   branch: string,
   reason: string,
-): Promise<string> {
+): Promise<PushResult> {
   const summary = [
     `## Omah — failed to push`,
     ``,
@@ -993,7 +988,7 @@ async function failStep(
   const file = process.env.GITHUB_STEP_SUMMARY;
   if (file) appendFileSync(file, summary + "\n");
   process.exitCode = 1;
-  return "";
+  return { url: "" };
 }
 
 async function writeStepSummary(
@@ -1001,7 +996,7 @@ async function writeStepSummary(
   repo: string,
   branch: string,
   reason: string,
-): Promise<string> {
+): Promise<PushResult> {
   const summary = [
     `## Omah — no PR (benign)`,
     ``,
@@ -1014,7 +1009,7 @@ async function writeStepSummary(
   ].join("\n");
   const file = process.env.GITHUB_STEP_SUMMARY;
   if (file) appendFileSync(file, summary + "\n");
-  return "";
+  return { url: "" };
 }
 
 function titleFor(c: Conversation, reviewConcerns: boolean): string {
@@ -1089,10 +1084,7 @@ function bodyFor(c: Conversation, reviewConcerns: boolean): string {
   const body = sections.join("\n");
 
   if (body.length > MAX_PR_BODY_CHARS) {
-    return (
-      body.slice(0, MAX_PR_BODY_CHARS - 100) +
-      "\n\n_[truncated — body exceeded size limit]_"
-    );
+    return body.slice(0, MAX_PR_BODY_CHARS - 100) + "\n\n_[truncated — body exceeded size limit]_";
   }
   return body;
 }
@@ -1100,6 +1092,70 @@ function bodyFor(c: Conversation, reviewConcerns: boolean): string {
 // ---------------------------------------------------------------
 // Usage summary
 // ---------------------------------------------------------------
+
+async function writeRunEntry(args: {
+  conversation: Conversation;
+  result: RunLoopResult;
+  keys: KeySpec[];
+  reviewOutcome: "skipped" | "pass" | "concerns";
+  reviewIssueCount: number;
+  fixRoundRan: boolean;
+  runStarted: number;
+  setupMs: number;
+  pushMs: number;
+  prUrl: string;
+  pushedSha?: string;
+  pushedTree?: string;
+}): Promise<void> {
+  if (!metaToken || !stateLoadOk) {
+    await log("runlog: skipping entry (no meta token or state not loaded)");
+    return;
+  }
+
+  const llmMs = usageLog.reduce((a, u) => a + u.ms, 0);
+  const tokensIn = usageLog.reduce((a, u) => a + u.input, 0);
+  const tokensOut = usageLog.reduce((a, u) => a + u.output, 0);
+
+  const keyStatsArray = Array.from(keyStats.entries()).map(([index, s]) => ({
+    index,
+    provider: args.keys[index]?.provider ?? "unknown",
+    calls: s.calls,
+    rate429: s.rate429,
+    errors: s.errors,
+  }));
+
+  const entry: RunEntry = {
+    id: args.conversation.taskId,
+    at: new Date().toISOString(),
+    targetRepo: args.conversation.targetRepo,
+    task: args.conversation.taskText.slice(0, 500),
+    status: args.result.status,
+    summary: args.result.summary.slice(0, 500),
+    blockedReason: args.result.status === "blocked" ? args.result.summary.slice(0, 300) : undefined,
+
+    steps: args.conversation.steps.length,
+    compressions: args.result.compressionsDone,
+
+    reviewOutcome: args.reviewOutcome,
+    reviewIssueCount: args.reviewIssueCount,
+    fixRoundRan: args.fixRoundRan,
+
+    wallMs: Date.now() - args.runStarted,
+    llmMs,
+    setupMs: args.setupMs,
+    pushMs: args.pushMs,
+    tokensIn,
+    tokensOut,
+
+    keyStats: keyStatsArray,
+
+    pushedSha: args.pushedSha,
+    pushedTree: args.pushedTree,
+    prUrl: args.prUrl || undefined,
+  };
+
+  await appendRunEntry(entry, metaToken, log);
+}
 
 function buildUsageSummary(args: {
   totalMs: number;
@@ -1141,12 +1197,8 @@ function buildUsageSummary(args: {
     const s = keyStats.get(i) ?? { calls: 0, rate429: 0, errors: 0 };
     const spec = args.keySpecs[i];
     const provider = spec?.provider ?? "?";
-    const err = s.lastError
-      ? s.lastError.replace(/\|/g, "\\|").slice(0, 100)
-      : "";
-    lines.push(
-      `| ${i + 1} | ${provider} | ${s.calls} | ${s.rate429} | ${s.errors} | ${err} |`,
-    );
+    const err = s.lastError ? s.lastError.replace(/\|/g, "\\|").slice(0, 100) : "";
+    lines.push(`| ${i + 1} | ${provider} | ${s.calls} | ${s.rate429} | ${s.errors} | ${err} |`);
   }
 
   lines.push("");
@@ -1175,15 +1227,11 @@ function writeRunSummary(text: string): void {
 // GitHub
 // ---------------------------------------------------------------
 
-async function signAppJwt(
-  appId: string,
-  privateKeyPem: string,
-): Promise<string> {
+async function signAppJwt(appId: string, privateKeyPem: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
   const payload = { iat: now - 60, exp: now + 9 * 60, iss: appId };
-  const b64 = (obj: unknown) =>
-    Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const b64 = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const unsigned = `${b64(header)}.${b64(payload)}`;
   const signer = createSign("RSA-SHA256");
   signer.update(unsigned);
@@ -1194,19 +1242,14 @@ async function signAppJwt(
 
 async function mintAppToken(jwt: string, targetRepo: string): Promise<string> {
   const [owner, repo] = targetRepo.split("/");
-  const instRes = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/installation`,
-    {
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/vnd.github+json",
-      },
+  const instRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/installation`, {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: "application/vnd.github+json",
     },
-  );
+  });
   if (!instRes.ok) {
-    throw new Error(
-      `could not find installation for ${targetRepo}: ${instRes.status}`,
-    );
+    throw new Error(`could not find installation for ${targetRepo}: ${instRes.status}`);
   }
   const inst: any = await instRes.json();
 
@@ -1233,9 +1276,7 @@ async function mintAppToken(jwt: string, targetRepo: string): Promise<string> {
   return token.token;
 }
 
-async function resolveAppIdentity(
-  jwt: string,
-): Promise<{ botId: string; appSlug: string }> {
+async function resolveAppIdentity(jwt: string): Promise<{ botId: string; appSlug: string }> {
   const res = await fetch("https://api.github.com/app", {
     headers: {
       Authorization: `Bearer ${jwt}`,
@@ -1248,9 +1289,7 @@ async function resolveAppIdentity(
 
   const botId = process.env.APP_BOT_ID;
   if (!botId) {
-    throw new Error(
-      "APP_BOT_ID is required. Set the OMAH_APP_BOT_ID repository variable.",
-    );
+    throw new Error("APP_BOT_ID is required. Set the OMAH_APP_BOT_ID repository variable.");
   }
   return { botId, appSlug };
 }
@@ -1280,10 +1319,7 @@ async function getRepo(client: any, fullName: string) {
 
 // ---------------------------------------------------------------
 
-if (
-  process.argv[1] &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(async (err) => {
     console.error("[omah] fatal:", err);
     if (metaToken && stateLoadOk && !stateSaved) {
