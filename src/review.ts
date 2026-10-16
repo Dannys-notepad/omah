@@ -130,14 +130,13 @@ export function readTestScript(pkg: unknown): string | null {
 // ---------------------------------------------------------------
 
 /**
- * Build the reviewer prompt. The reviewer sees the task, the diff, the
- * fresh test digest, and the file list. Nothing else.
+ * Assemble the reviewer's user message. Data only: task, files, test
+ * digest, diff. The rubric lives in review-system.md and is passed as
+ * the system prompt by the caller.
  */
 export function buildReviewPrompt(inputs: ReviewInputs): string {
   const lines: string[] = [];
 
-  lines.push("You are reviewing a code change produced by another agent.");
-  lines.push("");
   lines.push("## Task");
   lines.push("");
   lines.push(inputs.task.trim());
@@ -183,41 +182,6 @@ export function buildReviewPrompt(inputs: ReviewInputs): string {
   lines.push("```diff");
   lines.push(inputs.diff.trim() || "(empty)");
   lines.push("```");
-  lines.push("");
-  lines.push("## Your job");
-  lines.push("");
-  lines.push("Judge only these four things:");
-  lines.push("");
-  lines.push("1. Correctness: does the diff do what the task asked?");
-  lines.push("2. Scope creep: does it change anything the task did not ask for?");
-  lines.push("3. Tests: were missing or failing tests added or fixed?");
-  lines.push("4. Leftover debug code: console.log, TODO, commented-out blocks,");
-  lines.push("   hardcoded credentials, test-only branches.");
-  lines.push("");
-  lines.push("Ignore style, naming, formatting, and architectural preferences.");
-  lines.push("Do not suggest improvements. Do not re-implement the task.");
-  lines.push("");
-  lines.push("Severity guide:");
-  lines.push("- high: the change is wrong, incomplete, or breaks behavior.");
-  lines.push("- medium: a real problem the task implies, but not a break.");
-  lines.push("- low: worth noting, not worth a fix round.");
-  lines.push("");
-  lines.push('When you are unsure, return "pass". A false concern costs the');
-  lines.push("user a fix round. A missed concern costs nothing extra.");
-  lines.push("");
-  lines.push("## Response format");
-  lines.push("");
-  lines.push("Respond with strict JSON only. No prose, no fences. Exactly:");
-  lines.push("");
-  lines.push("{");
-  lines.push('  "verdict": "pass" | "concerns",');
-  lines.push('  "issues": [');
-  lines.push('    { "file": "path/to/file", "severity": "low"|"medium"|"high",');
-  lines.push('      "note": "one to three sentences" }');
-  lines.push("  ]");
-  lines.push("}");
-  lines.push("");
-  lines.push('Return "pass" with an empty issues array when nothing is wrong.');
 
   return lines.join("\n");
 }
@@ -364,7 +328,12 @@ export function buildFixRoundMessage(issues: ReviewIssue[]): string {
   }
   lines.push("");
   lines.push("Address only these issues. Do not make unrelated changes.");
-  lines.push("When done, call finish again.");
+  lines.push("");
+  lines.push(
+    "When done, call finish again with a summary that describes the " +
+      "complete task, not just this fix. The summary becomes the PR title " +
+      "and body, so it must cover the original change and this fix.",
+  );
   return lines.join("\n");
 }
 

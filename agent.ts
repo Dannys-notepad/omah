@@ -78,6 +78,10 @@ const RETRYABLE_KEY_COOLDOWN_MS = 30 * 1000;
 const OMAH_ROOT = "/tmp/omah";
 const WORKSPACE = path.join(OMAH_ROOT, "workspace");
 const SYSTEM_PROMPT_PATH = path.join(process.cwd(), "system.md");
+const REVIEWER_SYSTEM_PROMPT_PATH = path.join(
+  process.cwd(),
+  "review-system.md",
+);
 const IGNORE_FILE_PATH = path.join(process.cwd(), ".omahignore.default");
 const AGENT_USER = "omah-runner";
 const AGENT_HOME = `/home/${AGENT_USER}`;
@@ -99,9 +103,6 @@ const REVIEW_TEST_TIMEOUT_MS = 3 * 60 * 1000;
 const REVIEW_MIN_REMAINING_MS = 4 * 60 * 1000;
 const REVIEW_FIX_BUDGET_MS = 4 * 60 * 1000;
 const REVIEW_MAX_CALLS = 6;
-
-const REVIEWER_SYSTEM_PROMPT =
-  "You review code changes produced by another agent. Reply with strict JSON only.";
 
 // ---------------------------------------------------------------
 // Types
@@ -639,6 +640,18 @@ async function runReviewGate(
     return { ran: false, reenter: false, fixMessage: "", issues: [] };
   };
 
+  let reviewerSystemPrompt: string;
+try {
+  reviewerSystemPrompt = await fs.readFile(
+    REVIEWER_SYSTEM_PROMPT_PATH,
+    "utf8",
+  );
+} catch (err: any) {
+  return skip(
+    `reviewer system prompt not readable: ${String(err?.message ?? err).slice(0, 120)}`,
+  );
+}
+
   const remaining = WALL_CLOCK_MS - (Date.now() - args.runStartedAt);
   if (remaining < REVIEW_MIN_REMAINING_MS) {
     return skip(`only ${Math.round(remaining / 1000)}s left`);
@@ -725,9 +738,10 @@ if (diff.trim().length === 0) {
   });
 
   const call = await callReviewerWithRotation(
-    args.keys,
-    args.cooldownUntil,
-    prompt,
+  args.keys,
+  args.cooldownUntil,
+  reviewerSystemPrompt,
+  prompt,
   );
   if (!call) return skip("reviewer call failed on all attempted keys");
   const sameProviderAsWriter =
@@ -780,7 +794,8 @@ if (diff.trim().length === 0) {
 async function callReviewerWithRotation(
   keys: KeySpec[],
   cooldownUntil: Map<number, number>,
-  prompt: string,
+  systemPrompt: string,
+  userPrompt: string,
 ): Promise<{ text: string; provider: string } | null> {
   const now = Date.now();
   const isCooled = (index: number) => (cooldownUntil.get(index) ?? 0) > now;
@@ -809,13 +824,13 @@ async function callReviewerWithRotation(
     try {
       const provider = makeProvider(spec);
       const response = await provider.complete(
-        {
-          systemPrompt: REVIEWER_SYSTEM_PROMPT,
-          history: [{ role: "user", content: prompt }],
-          jsonMode: true,
-        },
-        keyIndex,
-      );
+  {
+    systemPrompt,
+    history: [{ role: "user", content: userPrompt }],
+    jsonMode: true,
+  },
+  keyIndex,
+);
       await log(`[review] called ${spec.provider} (key ${keyIndex + 1})`);
       return { text: response.text, provider: spec.provider };
     } catch (err: any) {
