@@ -265,8 +265,7 @@ async function main(): Promise<void> {
 
   await saveConversation(conversation, targetRepo, appToken);
 
-
-  const reviewStart = Date.now()
+  const reviewStart = Date.now();
   if (result.status === "done" && !conversation.reviewConcerns) {
     const outcome = await runReviewGate({
       conversation,

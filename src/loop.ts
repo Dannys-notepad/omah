@@ -295,10 +295,13 @@ export async function runLoop(
   const sharedQuotaProviders = new Set(
     sharedQuotaList.map((provider) => provider.trim().toLowerCase()).filter(Boolean),
   );
-  const history: Message[] = [];
   let consecutiveErrors = 0;
   let lastFailure = "";
   let keyIndex = 0;
+  const recentCalls: string[] = [];
+  const recentCallWindow = 5;
+
+  const history: Message[] = [];
 
   let lastCompressAtStepCount = args.conversation.steps.length > 0 ? -MIN_STEPS_BETWEEN : 0;
   let compressionsDone = 0;
@@ -833,13 +836,17 @@ export async function runLoop(
       isBash,
     );
 
+    const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+    const budgetMin = Math.round(maxRuntimeMs / 60_000);
     history.push({ role: "model", parts: [{ text: responseText }] });
     history.push({
       role: "user",
       step: stepNo,
       parts: [
         {
-          text: `Tool result (${result.ok ? "ok" : "error"}):\n${historyOutput}`,
+          text:
+            `Tool result (${result.ok ? "ok" : "error"}):\n${historyOutput}\n\n` +
+            `[elapsed ${elapsedSec}s of ${budgetMin}m budget]`,
         },
       ],
     });
@@ -850,6 +857,31 @@ export async function runLoop(
     } else {
       consecutiveErrors += 1;
       lastFailure = `${parsed.tool}: ${truncate(result.output, 300)}`;
+    }
+
+    const callHash = `${parsed.tool}\u0000${JSON.stringify(parsed.args)}\u0000${result.ok ? "ok" : "err"}`;
+    recentCalls.push(callHash);
+    if (recentCalls.length > recentCallWindow) recentCalls.shift();
+
+    const occurrences = recentCalls.filter((h) => h === callHash).length;
+    if (occurrences >= 3) {
+      await log(
+        `[loop] repetition detected: ${parsed.tool} called ${occurrences} times with the same args and outcome`,
+      );
+      history.push({
+        role: "user",
+        parts: [
+          {
+            text:
+              `You have made the same call (${parsed.tool} with these arguments) ` +
+              `${occurrences} times in a row and received the same kind of result. ` +
+              `The current approach is not making progress. Do not repeat this call. ` +
+              `Try a different approach, or call finish with status=blocked and explain why.`,
+          },
+        ],
+      });
+      recentCalls.length = 0;
+      consecutiveErrors += 1;
     }
 
     await saveConversation(args.conversation, args.targetRepo, args.appToken);
