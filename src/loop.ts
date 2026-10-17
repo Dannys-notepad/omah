@@ -300,6 +300,7 @@ export async function runLoop(
   let keyIndex = 0;
   const recentCalls: string[] = [];
   const recentCallWindow = 5;
+  let consecutiveEmptyReplies = 0;
 
   const history: Message[] = [];
 
@@ -445,6 +446,7 @@ export async function runLoop(
         invokeModel(provider, args.systemPrompt, history, writeState === null, keyIndex),
         remainingMs,
       );
+
       responseText = result.text;
       responseToolCalls = result.toolCalls;
       if (responseToolCalls?.length === 1) {
@@ -457,6 +459,28 @@ export async function runLoop(
         responseText = "[multiple native tool calls returned]";
       }
       responseNote = result.note;
+
+      const isEmptyReply = !responseToolCalls?.length && !responseText.trim();
+      if (isEmptyReply) {
+        consecutiveEmptyReplies += 1;
+        await log(
+          `[step ${stepForLog}] empty reply ` +
+            `(${result.usage.output} output tokens, ` +
+            `${consecutiveEmptyReplies} consecutive)`,
+        );
+        if (consecutiveEmptyReplies >= 2) {
+          return {
+            summary:
+              `Provider returned an empty reply ${consecutiveEmptyReplies} times in a row ` +
+              `(output hit ${result.usage.output} tokens; likely truncated at max_tokens). ` +
+              `Run blocked to avoid burning wall clock on silent truncation.`,
+            status: "blocked",
+            compressionsDone,
+          };
+        }
+      } else {
+        consecutiveEmptyReplies = 0;
+      }
       usageLog.push({
         step: stepForLog,
         input: result.usage.input,

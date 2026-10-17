@@ -139,7 +139,8 @@ export function loadAllKeys(log?: (msg: string) => Promise<void>): KeySpec[] {
   return out;
 }
 
-const MAX_OUTPUT_TOKENS = 16384;
+const MAX_OUTPUT_TOKENS_GEMINI = 16384;
+const MAX_OUTPUT_TOKENS_OPENAI = 4096;
 const FETCH_TIMEOUT_MS = 120_000;
 
 export function normalizeGeminiResponse(response: any): {
@@ -175,7 +176,7 @@ export class GeminiProvider implements LLMProvider {
     const config: Record<string, unknown> = {
       systemInstruction: req.systemPrompt,
       temperature: 0.2,
-      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      maxOutputTokens: MAX_OUTPUT_TOKENS_GEMINI,
     };
     if (req.tools?.length) {
       config.tools = [
@@ -207,7 +208,7 @@ export class GeminiProvider implements LLMProvider {
         config: {
           systemInstruction: req.systemPrompt,
           temperature: 0.2,
-          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          maxOutputTokens: MAX_OUTPUT_TOKENS_GEMINI,
           responseMimeType: "application/json",
         },
       } as any);
@@ -249,7 +250,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       model: this.model,
       messages,
       temperature: 0.2,
-      max_tokens: MAX_OUTPUT_TOKENS,
+      max_tokens: MAX_OUTPUT_TOKENS_OPENAI,
       ...(req.tools?.length
         ? {
             tools: req.tools.map((tool) => ({

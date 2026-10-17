@@ -162,6 +162,17 @@ export function rawWriteRetryInstruction(
   code: ChunkErrorCode,
   provider: string,
 ): string {
+  if (code === "TOOL_CALL_GUARD") {
+    return (
+      `The raw write for ${JSON.stringify(filePath)} was rejected: the harness received a JSON tool call ` +
+      `where it expected raw file bytes. Call request_write again for the same path. ` +
+      `When the harness asks for contents, your reply must be the file's bytes only. ` +
+      `Do not wrap them in {"tool": ...} or any other JSON object. ` +
+      `If the file is itself a JSON file, write the JSON contents directly — the harness expects ` +
+      `the literal bytes of the file, not a tool envelope containing them.`
+    );
+  }
+
   if (code === "FILE_TOO_LARGE") {
     return `The file ${JSON.stringify(filePath)} exceeds the write limit. Stop and finish as blocked; do not retry this file.`;
   }
