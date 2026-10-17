@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-17T09:42:04.204Z",
+  "keys": {
+    "gemini:d1db56f7": {
+      "status": "exhausted",
+      "reason": "PerDay",
+      "reset_at": "2026-10-18T07:00:00.000Z",
+      "last_seen": "2026-10-17T08:09:28.718Z"
+    },
+    "gemini:2fbc6e6a": {
+      "status": "exhausted",
+      "reason": "PerDay",
+      "reset_at": "2026-10-18T07:00:00.000Z",
+      "last_seen": "2026-10-17T08:10:28.919Z"
+    },
+    "gemini:e3816db0": {
+      "status": "exhausted",
+      "reason": "PerDay",
+      "reset_at": "2026-10-18T07:00:00.000Z",
+      "last_seen": "2026-10-17T08:58:32.371Z"
+    },
+    "gemini:bc3fad2a": {
+      "status": "exhausted",
+      "reason": "PerDay",
+      "reset_at": "2026-10-18T07:00:00.000Z",
+      "last_seen": "2026-10-17T08:59:06.879Z"
+    },
+    "gemini:27f29297": {
+      "status": "exhausted",
+      "reason": "PerDay",
+      "reset_at": "2026-10-18T07:00:00.000Z",
+      "last_seen": "2026-10-17T09:31:31.044Z"
+    }
+  }
+}
